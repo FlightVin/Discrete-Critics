@@ -178,6 +178,19 @@ def save_agent(agent, save_dir, epoch):
     print(f'Saved to {save_path}')
 
 
+def restore_agent_with_file(agent, file_path):
+    """Just like restore_agent() but expect file_path to include restore_epoch
+    """
+    assert os.path.exists(file_path), f'File {file_path} does not exist'
+    with open(file_path, 'rb') as f:
+        load_dict = pickle.load(f)
+
+    agent = flax.serialization.from_state_dict(agent, load_dict['agent'])
+
+    print(f'Restored from {file_path}')
+
+    return agent
+
 def restore_agent(agent, restore_path, restore_epoch):
     """Restore the agent from a file.
 

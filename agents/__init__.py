@@ -1,10 +1,7 @@
-from agents.fql import FQLAgent
-from agents.fql_iqn import FQLIQNAgent
-from agents.floq import FloQAgent
-
+from agents.acfql import ACFQLAgent
+from agents.acrlpd import ACRLPDAgent
 
 agents = dict(
-    fql=FQLAgent,
-    fqliqn = FQLIQNAgent,
-    floq = FloQAgent,
+    acfql=ACFQLAgent,
+    acrlpd=ACRLPDAgent,
 )
