@@ -18,4 +18,6 @@ python main.py \
     --agent.actor_num_samples=32 \
     --env_name=square-mh-low_dim \
     --sparse=True \
-    --horizon_length=5
+    --horizon_length=5 \
+    --n_eval_envs=32 \
+    --eval_episodes=2

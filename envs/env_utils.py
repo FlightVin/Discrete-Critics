@@ -6,6 +6,7 @@ import gymnasium
 import numpy as np
 import ogbench
 from gymnasium.spaces import Box
+from gymnasium.vector import AsyncVectorEnv, AutoresetMode
 
 from utils.datasets import Dataset
 
@@ -157,3 +158,31 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
             )
 
     return env, eval_env, train_dataset, val_dataset
+
+
+def make_vectorized_eval_envs(env_name, n_eval_envs, seed=0):
+    """Create a vectorized evaluation environment with n_eval_envs parallel copies.
+
+    Args:
+        env_name: Environment name (must be a robomimic env).
+        n_eval_envs: Number of parallel environments.
+        seed: Base random seed (each env gets seed + env_idx).
+
+    Returns:
+        AsyncVectorEnv with n_eval_envs sub-environments.
+    """
+    if env_name.startswith("lift") or env_name.startswith("can") or env_name.startswith("square") or \
+       env_name.startswith("transport") or env_name.startswith("tool_hang"):
+        from envs import robomimic_utils
+
+        def env_fn(env_idx):
+            env = robomimic_utils.make_env(env_name, seed=seed + env_idx)
+            return EpisodeMonitor(env)
+    else:
+        raise ValueError(f"make_vectorized_eval_envs: unsupported env '{env_name}'")
+
+    vec_env = AsyncVectorEnv(
+        [lambda idx=i: env_fn(idx) for i in range(n_eval_envs)],
+        autoreset_mode=AutoresetMode.DISABLED,
+    )
+    return vec_env

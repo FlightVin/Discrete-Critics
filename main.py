@@ -3,14 +3,14 @@ from absl import app, flags
 from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
-from envs.env_utils import make_env_and_datasets
+from envs.env_utils import make_env_and_datasets, make_vectorized_eval_envs
 from envs.ogbench_utils import make_ogbench_env_and_datasets
 from envs.robomimic_utils import is_robomimic_env
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
 
-from evaluation import evaluate
+from evaluation import evaluate, evaluate_parallel
 from agents import agents
 import numpy as np
 
@@ -39,6 +39,7 @@ flags.DEFINE_integer('utd_ratio', 1, "update to data ratio")
 flags.DEFINE_float('discount', 0.99, 'discount factor')
 
 flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
+flags.DEFINE_integer('n_eval_envs', 1, 'Number of parallel eval environments (1 = sequential).')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
@@ -94,6 +95,11 @@ def main(_):
         )
     else:
         env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
+
+    # Create vectorized eval envs for parallel evaluation
+    eval_envs = None
+    if FLAGS.n_eval_envs > 1:
+        eval_envs = make_vectorized_eval_envs(FLAGS.env_name, FLAGS.n_eval_envs, seed=FLAGS.seed + 1000)
 
     # house keeping
     random.seed(FLAGS.seed)
@@ -192,14 +198,24 @@ def main(_):
         if i == FLAGS.offline_steps - 1 or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
             # during eval, the action chunk is executed fully
-            eval_info, _, _ = evaluate(
-                agent=agent,
-                env=eval_env,
-                action_dim=example_batch["actions"].shape[-1],
-                num_eval_episodes=FLAGS.eval_episodes,
-                num_video_episodes=FLAGS.video_episodes,
-                video_frame_skip=FLAGS.video_frame_skip,
-            )
+            _action_dim = example_batch["actions"].shape[-1]
+            if eval_envs is not None:
+                eval_info, _, _ = evaluate_parallel(
+                    agent=agent,
+                    envs=eval_envs,
+                    num_eval_envs=FLAGS.n_eval_envs,
+                    eval_episodes=FLAGS.eval_episodes,
+                    action_dim=_action_dim,
+                )
+            else:
+                eval_info, _, _ = evaluate(
+                    agent=agent,
+                    env=eval_env,
+                    action_dim=_action_dim,
+                    num_eval_episodes=FLAGS.eval_episodes,
+                    num_video_episodes=FLAGS.video_episodes,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                )
             logger.log(eval_info, "eval", step=log_step)
 
     # transition from offline to online
@@ -296,14 +312,23 @@ def main(_):
 
         if i == FLAGS.online_steps - 1 or \
             (FLAGS.eval_interval != 0 and i % FLAGS.eval_interval == 0):
-            eval_info, _, _ = evaluate(
-                agent=agent,
-                env=eval_env,
-                action_dim=action_dim,
-                num_eval_episodes=FLAGS.eval_episodes,
-                num_video_episodes=FLAGS.video_episodes,
-                video_frame_skip=FLAGS.video_frame_skip,
-            )
+            if eval_envs is not None:
+                eval_info, _, _ = evaluate_parallel(
+                    agent=agent,
+                    envs=eval_envs,
+                    num_eval_envs=FLAGS.n_eval_envs,
+                    eval_episodes=FLAGS.eval_episodes,
+                    action_dim=action_dim,
+                )
+            else:
+                eval_info, _, _ = evaluate(
+                    agent=agent,
+                    env=eval_env,
+                    action_dim=action_dim,
+                    num_eval_episodes=FLAGS.eval_episodes,
+                    num_video_episodes=FLAGS.video_episodes,
+                    video_frame_skip=FLAGS.video_frame_skip,
+                )
             logger.log(eval_info, "eval", step=log_step)
 
         # saving

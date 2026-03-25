@@ -2,7 +2,7 @@ from collections import defaultdict
 
 import jax
 import numpy as np
-from tqdm import trange
+from tqdm import trange, tqdm
 from functools import partial
 
 
@@ -159,3 +159,94 @@ def evaluate(
 
     return stats, trajs, renders
 
+
+def flatten_async(d, idx, parent_key='', sep='.'):
+    """Flatten a vectorized info dict, extracting element at index idx."""
+    items = []
+    for k, v in d.items():
+        new_key = parent_key + sep + k if parent_key else k
+        if hasattr(v, 'items'):
+            items.extend(flatten(v, new_key, sep=sep).items())
+        else:
+            try:
+                items.append((new_key, v[idx]))
+            except (TypeError, IndexError):
+                items.append((new_key, v))
+    return dict(items)
+
+
+def evaluate_parallel(
+    agent,
+    envs,
+    num_eval_envs,
+    eval_episodes,
+    action_dim,
+):
+    """Evaluate the agent using a vectorized (parallel) environment.
+
+    Args:
+        agent: Agent.
+        envs: AsyncVectorEnv with num_eval_envs parallel environments.
+        num_eval_envs: Number of parallel environments.
+        eval_episodes: Number of complete episodes to run per environment.
+        action_dim: Per-step action dimension.
+
+    Returns:
+        A tuple (stats, [], []) compatible with the sequential evaluate() signature.
+    """
+    total_episodes = num_eval_envs * eval_episodes
+    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+
+    stats = defaultdict(list)
+    pbar = tqdm(total=total_episodes, desc="Parallel Eval", dynamic_ncols=True)
+
+    for rollout_idx in range(eval_episodes):
+        observations, _ = envs.reset()
+
+        action_queues = [[] for _ in range(num_eval_envs)]
+        active_envs = np.ones(num_eval_envs, dtype=bool)
+
+        while np.any(active_envs):
+            # Collect envs that need new action chunks
+            envs_needing_actions = [i for i, q in enumerate(action_queues) if not q and active_envs[i]]
+            if envs_needing_actions:
+                obs_to_act = observations[envs_needing_actions]
+                n_need = len(envs_needing_actions)
+
+                # Pad batch to fixed size to avoid JIT recompilation as envs finish
+                if n_need < num_eval_envs:
+                    pad = np.zeros((num_eval_envs - n_need,) + obs_to_act.shape[1:], dtype=obs_to_act.dtype)
+                    obs_padded = np.concatenate([obs_to_act, pad], axis=0)
+                    action_chunks = np.array(actor_fn(observations=obs_padded))
+                    action_chunks = action_chunks.reshape(num_eval_envs, -1, action_dim)[:n_need]
+                else:
+                    action_chunks = np.array(actor_fn(observations=obs_to_act))
+                    action_chunks = action_chunks.reshape(n_need, -1, action_dim)
+
+                for i, env_idx in enumerate(envs_needing_actions):
+                    for a in action_chunks[i]:
+                        action_queues[env_idx].append(a)
+
+            # Build step actions (dummy zeros for inactive/waiting envs)
+            step_actions = []
+            for i in range(num_eval_envs):
+                if active_envs[i] and action_queues[i]:
+                    step_actions.append(action_queues[i].pop(0))
+                else:
+                    step_actions.append(np.zeros(action_dim))
+
+            observations, rewards, terminations, truncations, infos = envs.step(np.array(step_actions))
+            dones = np.logical_or(terminations, truncations)
+
+            for i in range(num_eval_envs):
+                if active_envs[i] and dones[i]:
+                    add_to(stats, flatten_async(infos, i))
+                    active_envs[i] = False
+                    pbar.update(1)
+
+    pbar.close()
+
+    for k, v in stats.items():
+        stats[k] = np.mean(v)
+
+    return stats, [], []
