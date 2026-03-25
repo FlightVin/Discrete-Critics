@@ -222,8 +222,10 @@ class RobomimicLowdimWrapper(gym.Env):
         else:
             np.random.seed()
 
-    def reset(self, options={}, **kwargs):
+    def reset(self, options=None, **kwargs):
         """Ignore passed-in arguments like seed"""
+        if options is None:
+            options = {}
 
         self.t = 0
         self.episode_return, self.episode_length = 0, 0

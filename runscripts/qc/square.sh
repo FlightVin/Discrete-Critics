@@ -20,4 +20,5 @@ python main.py \
     --sparse=True \
     --horizon_length=5 \
     --n_eval_envs=32 \
-    --eval_episodes=2
+    --eval_episodes=2 \
+    --eval_interval=1000
