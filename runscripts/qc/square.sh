@@ -21,4 +21,4 @@ python main.py \
     --horizon_length=5 \
     --n_eval_envs=32 \
     --eval_episodes=2 \
-    --eval_interval=1000
+    --eval_interval=100000
