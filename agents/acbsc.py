@@ -41,9 +41,20 @@ class ACBSCAgent(flax.struct.PyTreeNode):
         else:
             batch_actions = batch["actions"][..., 0, :]
 
-        # Sample next action chunk from the actor.
+        # Sample next action chunk for the TD target.
+        # critic_target_bon=True  → best-of-n (uses online critic to pick best sample)
+        # critic_target_bon=False → single BC flow sample, no critic-based selection
         rng, sample_rng = jax.random.split(rng)
-        next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+        next_obs = batch['next_observations'][..., -1, :]
+        if self.config['critic_target_bon']:
+            next_actions = self.sample_actions(next_obs, rng=sample_rng)
+        else:
+            action_dim = self.config['action_dim'] * (
+                self.config['horizon_length'] if self.config['action_chunking'] else 1
+            )
+            noises = jax.random.normal(sample_rng, (next_obs.shape[0], action_dim))
+            next_actions = self.compute_flow_actions(next_obs, noises)
+            next_actions = jnp.clip(next_actions, -1, 1)
 
         # Target critic outputs are logits; convert to probabilities ∈ [0, 1].
         next_qs = self.network.select('target_critic')(
@@ -385,6 +396,7 @@ def get_config():
             fourier_feature_dim=64,
             weight_decay=0.,
             beta=1.0,               # Q-loss scale (new vs ACFQL). Controls Q signal vs BC/distillation.
+            critic_target_bon=True, # If False, use a single BC flow sample for TD targets instead of best-of-n.
         )
     )
     return config
