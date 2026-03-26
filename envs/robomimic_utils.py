@@ -106,7 +106,8 @@ def get_dataset(env, env_name):
     terminals = []
     rewards = []
     masks = []
-    
+    bsc_terminals = []  # marks last step of EVERY episode (success AND timeout) — BSC only
+
     # go through and add to the data holder
     for ep in demos:
         a = np.array(rm_dataset["data/{}/actions".format(ep)])
@@ -119,20 +120,27 @@ def get_dataset(env, env_name):
         next_obs = np.concatenate(next_obs, axis=-1)
         dones = np.array(rm_dataset["data/{}/dones".format(ep)])
         r = np.array(rm_dataset["data/{}/rewards".format(ep)])
-        
+
+        # bsc_terminals: dones marks only success episodes; force last step of
+        # every episode to 1 so BSC can see timeout boundaries too.
+        ep_boundaries = dones.copy()
+        ep_boundaries[-1] = 1
+
         observations.append(obs.astype(np.float32))
         actions.append(a.astype(np.float32))
         rewards.append(r.astype(np.float32))
         terminals.append(dones.astype(np.float32))
         masks.append(1.0 - dones.astype(np.float32))
+        bsc_terminals.append(ep_boundaries.astype(np.float32))
         next_observations.append(next_obs.astype(np.float32))
-    
+
     return Dataset.create(
         observations=np.concatenate(observations, axis=0),
         actions=np.concatenate(actions, axis=0),
         rewards=np.concatenate(rewards, axis=0),
         terminals=np.concatenate(terminals, axis=0),
         masks=np.concatenate(masks, axis=0),
+        bsc_terminals=np.concatenate(bsc_terminals, axis=0),
         next_observations=np.concatenate(next_observations, axis=0),
     )
 

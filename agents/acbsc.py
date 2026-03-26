@@ -95,6 +95,64 @@ class ACBSCAgent(flax.struct.PyTreeNode):
         critic_loss = optax.sigmoid_binary_cross_entropy(q_logit, target_q[None])
         critic_loss = (critic_loss * batch['valid'][..., -1][None]).mean()
 
+        # ── Debug prints ───────────────────────────────────────────────────────
+        valid_last = batch['valid'][..., -1]                    # (B,)
+        is_timeout = bsc_is_terminal & ~bsc_is_success
+
+        # Reward signal sanity
+        jax.debug.print(
+            "[BSC-TD] last_step_contribution  mean={lsc_mean:.4f}  min={lsc_min:.4f}  max={lsc_max:.4f}",
+            lsc_mean=last_step_contribution.mean(),
+            lsc_min=last_step_contribution.min(),
+            lsc_max=last_step_contribution.max(),
+        )
+
+        # Sequence classification (over full batch, before valid filter)
+        jax.debug.print(
+            "[BSC-TD] fracs (all)  success={s:.3f}  timeout={t:.3f}  non-term={nt:.3f}  valid_last={v:.3f}",
+            s=bsc_is_success.astype(jnp.float32).mean(),
+            t=is_timeout.astype(jnp.float32).mean(),
+            nt=(~bsc_is_terminal).astype(jnp.float32).mean(),
+            v=valid_last.mean(),
+        )
+
+        # Among VALID sequences only
+        n_valid = valid_last.sum().clip(min=1)
+        jax.debug.print(
+            "[BSC-TD] fracs (valid only)  success={s:.3f}  timeout={t:.3f}  non-term={nt:.3f}",
+            s=(bsc_is_success * valid_last).sum() / n_valid,
+            t=(is_timeout * valid_last).sum() / n_valid,
+            nt=((~bsc_is_terminal) * valid_last).sum() / n_valid,
+        )
+
+        # Target Q distribution
+        jax.debug.print(
+            "[BSC-TD] target_q  mean={m:.4f}  min={lo:.4f}  max={hi:.4f}  (next_q mean={nq:.4f})",
+            m=target_q.mean(),
+            lo=target_q.min(),
+            hi=target_q.max(),
+            nq=next_q.mean(),
+        )
+
+        # Online critic logit and Q
+        jax.debug.print(
+            "[BSC-TD] q_logit  mean={lm:.3f}  min={ll:.3f}  max={lh:.3f}  |  Q=sigmoid(logit) mean={qm:.4f}",
+            lm=q_logit.mean(),
+            ll=q_logit.min(),
+            lh=q_logit.max(),
+            qm=jax.nn.sigmoid(q_logit).mean(),
+        )
+
+        # BCE loss breakdown: average loss per sequence class (valid only)
+        bce_per_sample = optax.sigmoid_binary_cross_entropy(q_logit.mean(axis=0), target_q)
+        jax.debug.print(
+            "[BSC-TD] BCE loss (valid)  success={ls:.4f}  timeout={lt:.4f}  non-term={lnt:.4f}",
+            ls=(bce_per_sample * bsc_is_success * valid_last).sum() / (bsc_is_success * valid_last).sum().clip(min=1),
+            lt=(bce_per_sample * is_timeout * valid_last).sum() / (is_timeout * valid_last).sum().clip(min=1),
+            lnt=(bce_per_sample * (~bsc_is_terminal) * valid_last).sum() / ((~bsc_is_terminal) * valid_last).sum().clip(min=1),
+        )
+        # ── End debug prints ───────────────────────────────────────────────────
+
         return critic_loss, {
             'critic_loss': critic_loss,
             'q': jax.nn.sigmoid(q_logit).mean(),
