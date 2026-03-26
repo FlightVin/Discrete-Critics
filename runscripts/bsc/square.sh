@@ -11,7 +11,7 @@
 
 export MUJOCO_GL=egl
 export WANDB_ENTITY=RL-experiments
-cd "$(dirname "$0")/../.."
+cd /home/mananaga/BSC_branches/manan_qc/Binary-Success-Critic
 python main.py \
     --run_group=BSC \
     --project_name=BSC \
