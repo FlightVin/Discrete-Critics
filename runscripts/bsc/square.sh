@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=VRAM_48GB
 #SBATCH --cpus-per-task=20
-#SBATCH --mem=100G
+#SBATCH --mem=80G
 #SBATCH --time=48:00:00
 #SBATCH --output=/home/mananaga/logs/%j/.out
 #SBATCH --error=/home/mananaga/logs/%j/.out
