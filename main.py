@@ -285,6 +285,7 @@ def main(_):
             actions=action,
             rewards=int_reward,
             terminals=float(done),
+            bsc_terminals=float(done),
             masks=1.0 - terminated,
             next_observations=next_ob,
         )
