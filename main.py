@@ -22,6 +22,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_string('project_name', 'qc', 'WandB project name.')
+flags.DEFINE_string('wandb_name', None, 'WandB run name. Defaults to run_group if not set.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'cube-triple-play-singletask-task2-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
@@ -68,7 +69,7 @@ class LoggingHelper:
 
 def main(_):
     exp_name = get_exp_name(FLAGS.seed)
-    run = setup_wandb(project=FLAGS.project_name, group=FLAGS.run_group, name=FLAGS.run_group)
+    run = setup_wandb(project=FLAGS.project_name, group=FLAGS.run_group, name=FLAGS.wandb_name or FLAGS.run_group)
     
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, FLAGS.env_name, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)

@@ -16,6 +16,7 @@ cd /home/mananaga/BSC_branches/manan_qc/Binary-Success-Critic
 # === Defaults ===
 run_group="BSC"
 project_name="BSC"
+wandb_name="run-name"
 actor_type="best-of-n"
 critic_target_bon=False
 use_mc_target=False
@@ -47,6 +48,7 @@ done
 python main.py \
     --run_group=$run_group \
     --project_name=$project_name \
+    --wandb_name=$wandb_name \
     --agent=agents/acbsc.py \
     --agent.actor_type=$actor_type \
     --agent.critic_target_bon=$critic_target_bon \
