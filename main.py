@@ -167,6 +167,11 @@ def main(_):
                 num_chunks_to_timeout[start:end_excl] = np.ceil((max_ep_len - local_steps) / H)
             if success_flags[i] == 1.0:
                 num_chunks_to_success[start:end_excl] = np.ceil((traj_len - local_steps) / H)
+        num_chunks_to_timeout = np.maximum(num_chunks_to_timeout, 0)
+        success_mask = num_chunks_to_success >= 0
+        num_chunks_to_success[success_mask] = np.minimum(
+            num_chunks_to_success[success_mask], num_chunks_to_timeout[success_mask]
+        )
         ds_dict['num_chunks_to_timeout'] = num_chunks_to_timeout
         ds_dict['num_chunks_to_success'] = num_chunks_to_success
 
