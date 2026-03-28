@@ -77,14 +77,21 @@ class ACBSCAgent(flax.struct.PyTreeNode):
         bsc_is_success  = last_step_contribution > -1e-6   # True only at success terminal
         bsc_is_terminal = batch['terminals'][..., -1] > 0.5  # True at any trajectory boundary
 
-        # BSC target:
-        #   success  → 1.0
-        #   timeout  → 0.0  (bsc_is_terminal=True, bsc_is_success=False → neither term fires)
-        #   non-term → discount * Q_target(s', next_chunk)
-        target_q = (
-            bsc_is_success.astype(jnp.float32) * 1.0
-            + (~bsc_is_terminal).astype(jnp.float32) * self.config['discount'] * next_q
-        )
+        if self.config['use_mc_target']:
+            # Monte-Carlo target: use the known final outcome of the trajectory directly.
+            # For success trajectories every transition gets target 1.0; for timeout 0.0.
+            # Terminal transitions already have the correct label via final_outcome, so no
+            # special-casing of success/timeout terminals is needed.
+            target_q = batch['final_outcome']
+        else:
+            # Standard BSC TD target:
+            #   success  → 1.0
+            #   timeout  → 0.0  (bsc_is_terminal=True, bsc_is_success=False → neither fires)
+            #   non-term → discount * Q_target(s', next_chunk)
+            target_q = (
+                bsc_is_success.astype(jnp.float32) * 1.0
+                + (~bsc_is_terminal).astype(jnp.float32) * self.config['discount'] * next_q
+            )
 
         # Critic output is an unbounded logit. BCE uses logits directly for numerical stability.
         # q_logit shape: (num_ensembles, B). target_q shape: (B,).
@@ -397,6 +404,8 @@ def get_config():
             weight_decay=0.,
             beta=1.0,               # Q-loss scale (new vs ACFQL). Controls Q signal vs BC/distillation.
             critic_target_bon=True, # If False, use a single BC flow sample for TD targets instead of best-of-n.
+            use_mc_target=False,    # If True, use the trajectory's final outcome (MC) as target for all
+                                    # transitions instead of bootstrapping non-terminal steps via TD.
         )
     )
     return config

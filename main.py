@@ -114,7 +114,7 @@ def main(_):
     # handle dataset
     def process_train_dataset(ds):
         """
-        Process the train dataset to 
+        Process the train dataset to
             - handle dataset proportion
             - handle sparse reward
             - convert to action chunked dataset
@@ -126,19 +126,37 @@ def main(_):
             ds = Dataset.create(
                 **{k: v[:new_size] for k, v in ds.items()}
             )
-        
+
         if is_robomimic_env(FLAGS.env_name):
             penalty_rewards = ds["rewards"] - 1.0
             ds_dict = {k: v for k, v in ds.items()}
             ds_dict["rewards"] = penalty_rewards
             ds = Dataset.create(**ds_dict)
-        
+
         if FLAGS.sparse:
             # Create a new dataset with modified rewards instead of trying to modify the frozen one
             sparse_rewards = (ds["rewards"] != 0.0) * -1.0
             ds_dict = {k: v for k, v in ds.items()}
             ds_dict["rewards"] = sparse_rewards
             ds = Dataset.create(**ds_dict)
+
+        # Compute final_outcome per transition: 1.0 if the trajectory eventually succeeded,
+        # 0.0 if it timed out.  Done after all reward transforms so we can detect success
+        # via reward > -1e-6 (success step has reward 0.0, timeout has reward -1.0).
+        #
+        # For robomimic, `terminals` (= dones) marks ONLY success episode boundaries;
+        # timeout episodes have terminals=0 throughout.  Use `bsc_terminals` when available
+        # since it marks ALL episode boundaries (success AND timeout).
+        ds_dict = {k: v for k, v in ds.items()}
+        boundary_field = 'bsc_terminals' if 'bsc_terminals' in ds_dict else 'terminals'
+        terminal_locs = np.nonzero(np.array(ds_dict[boundary_field]) > 0)[0]
+        traj_endpoints = np.concatenate([[0], terminal_locs + 1])
+        traj_lengths = np.diff(traj_endpoints)
+        success_flags = (np.array(ds_dict['rewards'])[terminal_locs] > -1e-6).astype(np.float32)
+        final_outcomes = np.zeros(ds.size, dtype=np.float32)
+        final_outcomes[:traj_endpoints[-1]] = np.repeat(success_flags, traj_lengths)
+        ds_dict['final_outcome'] = final_outcomes
+        ds = Dataset.create(**ds_dict)
 
         return ds
     
@@ -233,6 +251,7 @@ def main(_):
 
     from collections import defaultdict
     data = defaultdict(list)
+    episode_ptrs = []  # replay buffer indices for the current episode
     online_init_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
@@ -288,11 +307,19 @@ def main(_):
             bsc_terminals=float(done),
             masks=1.0 - terminated,
             next_observations=next_ob,
+            final_outcome=0.0,  # placeholder; updated retroactively on episode end
         )
         replay_buffer.add_transition(transition)
-        
+        episode_ptrs.append((replay_buffer.pointer - 1) % replay_buffer.max_size)
+
         # done
         if done:
+            # Retroactively label every transition in this episode with the final outcome.
+            # terminated=True means the agent reached the goal; truncated=True means timeout.
+            final_out = 1.0 if terminated else 0.0
+            for ptr in episode_ptrs:
+                replay_buffer._dict['final_outcome'][ptr] = final_out
+            episode_ptrs = []
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
         else:

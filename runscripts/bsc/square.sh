@@ -18,6 +18,7 @@ python main.py \
     --agent=agents/acbsc.py \
     --agent.actor_type=best-of-n \
     --agent.critic_target_bon=False \
+    --agent.use_mc_target=False \
     --agent.actor_num_samples=32 \
     --env_name=square-mh-low_dim \
     --sparse=True \
