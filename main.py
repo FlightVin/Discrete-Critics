@@ -203,7 +203,7 @@ def main(_):
 
         batch = train_dataset.sample_sequence(config['batch_size'], sequence_length=FLAGS.horizon_length, discount=discount)
 
-        agent, offline_info = agent.update(batch)
+        agent, offline_info = agent.offline_update(batch)
 
         if i % FLAGS.log_interval == 0:
             logger.log(offline_info, "offline_agent", step=log_step)

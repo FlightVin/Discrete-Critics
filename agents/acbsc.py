@@ -212,6 +212,39 @@ class ACBSCAgent(flax.struct.PyTreeNode):
     def update(self, batch):
         return self._update(self, batch)
 
+    @staticmethod
+    def _offline_update(agent, batch):
+        """Offline update: trains actor always; trains critic only if train_critic_offline=True."""
+        new_rng, rng = jax.random.split(agent.rng)
+
+        def loss_fn(grad_params):
+            info = {}
+            rng_ = rng
+            rng_, actor_rng, critic_rng = jax.random.split(rng_, 3)
+
+            actor_loss, actor_info = agent.actor_loss(batch, grad_params, actor_rng)
+            for k, v in actor_info.items():
+                info[f'actor/{k}'] = v
+
+            if agent.config['train_critic_offline']:
+                critic_loss, critic_info = agent.critic_loss(batch, grad_params, critic_rng)
+                for k, v in critic_info.items():
+                    info[f'critic/{k}'] = v
+                loss = actor_loss + critic_loss
+            else:
+                loss = actor_loss
+
+            return loss, info
+
+        new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+        if agent.config['train_critic_offline']:
+            agent.target_update(new_network, 'critic')
+        return agent.replace(network=new_network, rng=new_rng), info
+
+    @jax.jit
+    def offline_update(self, batch):
+        return self._offline_update(self, batch)
+
     @jax.jit
     def batch_update(self, batch):
         """Vectorised update over a leading batch dimension (for UTD > 1)."""
@@ -406,6 +439,7 @@ def get_config():
             critic_target_bon=True, # If False, use a single BC flow sample for TD targets instead of best-of-n.
             use_mc_target=False,    # If True, use the trajectory's final outcome (MC) as target for all
                                     # transitions instead of bootstrapping non-terminal steps via TD.
+            train_critic_offline=True,  # If False, skip critic training during offline phase (actor/BC only).
         )
     )
     return config
