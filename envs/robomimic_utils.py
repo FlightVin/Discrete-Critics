@@ -116,14 +116,15 @@ def get_dataset(env, env_name):
             next_obs.append(np.array(rm_dataset[f"data/{ep}/next_obs/{k}"]))
         obs = np.concatenate(obs, axis=-1)
         next_obs = np.concatenate(next_obs, axis=-1)
-        dones = np.array(rm_dataset["data/{}/dones".format(ep)])
         r = np.array(rm_dataset["data/{}/rewards".format(ep)])
+        ep_dones = np.zeros(len(a), dtype=np.float32)
+        ep_dones[-1] = 1.0
 
         observations.append(obs.astype(np.float32))
         actions.append(a.astype(np.float32))
         rewards.append(r.astype(np.float32))
-        terminals.append(dones.astype(np.float32))
-        masks.append(1.0 - dones.astype(np.float32))
+        terminals.append(ep_dones)
+        masks.append(1.0 - ep_dones)
         next_observations.append(next_obs.astype(np.float32))
 
     return Dataset.create(
