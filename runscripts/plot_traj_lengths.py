@@ -27,14 +27,12 @@ max_ep_len   = get_max_episode_length(args.env_name)
 f = h5py.File(dataset_path, 'r')
 demos = sorted(list(f['data'].keys()), key=lambda x: int(x[5:]))
 true_lengths = np.array([f[f'data/{ep}/actions'].shape[0] for ep in demos])
-all_dones = np.concatenate([np.array(f[f'data/{ep}/dones']) for ep in demos])
 f.close()
 
-# --- Dones-based lengths (as get_dataset sees them) ---
-terminal_locs  = np.nonzero(all_dones > 0)[0]
-traj_endpoints = np.concatenate([[0], terminal_locs + 1])
-if traj_endpoints[-1] < len(all_dones):
-    traj_endpoints = np.concatenate([traj_endpoints, [len(all_dones)]])
+# --- Fixed dones (as get_dataset now produces: terminal only at last step per episode) ---
+# terminal_locs are the last indices of each episode: cumsum(lengths) - 1
+fixed_terminal_locs = np.cumsum(true_lengths) - 1
+traj_endpoints = np.concatenate([[0], fixed_terminal_locs + 1])
 dones_lengths = np.diff(traj_endpoints)
 
 def print_stats(name, lengths):
@@ -47,13 +45,13 @@ def print_stats(name, lengths):
     print(f"Longer than max_ep_len: {n_over} ({100*n_over/len(lengths):.1f}%)")
 
 print_stats("True HDF5 episode lengths", true_lengths)
-print_stats("Dones-based lengths (get_dataset)", dones_lengths)
+print_stats("Fixed dones lengths (get_dataset after fix)", dones_lengths)
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
 for ax, lengths, title in [
     (axes[0], true_lengths,  f"True HDF5 episode lengths — {args.env_name}"),
-    (axes[1], dones_lengths, f"Dones-based lengths (get_dataset) — {args.env_name}"),
+    (axes[1], dones_lengths, f"Fixed dones lengths (get_dataset after fix) — {args.env_name}"),
 ]:
     n_over = (lengths > max_ep_len).sum()
     ax.hist(lengths, bins=60, color='steelblue', edgecolor='white', linewidth=0.3)
