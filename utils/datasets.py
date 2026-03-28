@@ -150,6 +150,16 @@ class Dataset(FrozenDict):
         else:
             final_outcome = np.zeros(batch_size, dtype=np.float32)
 
+        if 'num_chunks_to_timeout' in self:
+            num_chunks_to_timeout = self['num_chunks_to_timeout'][idxs]  # (batch_size,)
+        else:
+            num_chunks_to_timeout = np.zeros(batch_size, dtype=np.float32)
+
+        if 'num_chunks_to_success' in self:
+            num_chunks_to_success = self['num_chunks_to_success'][idxs]  # (batch_size,) — -1 for failed trajs
+        else:
+            num_chunks_to_success = np.full(batch_size, -1.0, dtype=np.float32)
+
         return dict(
             observations=data['observations'].copy(),
             full_observations=observations,
@@ -161,6 +171,8 @@ class Dataset(FrozenDict):
             next_observations=next_observations,
             next_actions=next_actions,
             final_outcome=final_outcome,
+            num_chunks_to_timeout=num_chunks_to_timeout,
+            num_chunks_to_success=num_chunks_to_success,
         )
 
     def get_subset(self, idxs):

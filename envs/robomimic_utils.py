@@ -31,7 +31,7 @@ low_dim_keys = {"low_dim": ('robot0_eef_pos',
 ObsUtils.initialize_obs_modality_mapping_from_dict(low_dim_keys)
 
 
-def _get_max_episode_length(env_name):
+def get_max_episode_length(env_name):
     if env_name.startswith("lift"):
         return 300
     elif env_name.startswith("can"):
@@ -54,7 +54,7 @@ def make_env(env_name, seed=0):
     dataset_path = _check_dataset_exists(env_name)
 
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
-    max_episode_length = _get_max_episode_length(env_name)
+    max_episode_length = get_max_episode_length(env_name)
     
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
@@ -106,8 +106,6 @@ def get_dataset(env, env_name):
     terminals = []
     rewards = []
     masks = []
-    bsc_terminals = []  # marks last step of EVERY episode (success AND timeout) — BSC only
-
     # go through and add to the data holder
     for ep in demos:
         a = np.array(rm_dataset["data/{}/actions".format(ep)])
@@ -121,17 +119,11 @@ def get_dataset(env, env_name):
         dones = np.array(rm_dataset["data/{}/dones".format(ep)])
         r = np.array(rm_dataset["data/{}/rewards".format(ep)])
 
-        # bsc_terminals: dones marks only success episodes; force last step of
-        # every episode to 1 so BSC can see timeout boundaries too.
-        ep_boundaries = dones.copy()
-        ep_boundaries[-1] = 1
-
         observations.append(obs.astype(np.float32))
         actions.append(a.astype(np.float32))
         rewards.append(r.astype(np.float32))
         terminals.append(dones.astype(np.float32))
         masks.append(1.0 - dones.astype(np.float32))
-        bsc_terminals.append(ep_boundaries.astype(np.float32))
         next_observations.append(next_obs.astype(np.float32))
 
     return Dataset.create(
@@ -140,7 +132,6 @@ def get_dataset(env, env_name):
         rewards=np.concatenate(rewards, axis=0),
         terminals=np.concatenate(terminals, axis=0),
         masks=np.concatenate(masks, axis=0),
-        bsc_terminals=np.concatenate(bsc_terminals, axis=0),
         next_observations=np.concatenate(next_observations, axis=0),
     )
 

@@ -5,7 +5,7 @@ from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger
 
 from envs.env_utils import make_env_and_datasets, make_vectorized_eval_envs
 from envs.ogbench_utils import make_ogbench_env_and_datasets
-from envs.robomimic_utils import is_robomimic_env
+from envs.robomimic_utils import is_robomimic_env, get_max_episode_length
 
 from utils.flax_utils import save_agent
 from utils.datasets import Dataset, ReplayBuffer
@@ -112,6 +112,8 @@ def main(_):
     discount = FLAGS.discount
     config["horizon_length"] = FLAGS.horizon_length
 
+    max_ep_len = get_max_episode_length(FLAGS.env_name) if is_robomimic_env(FLAGS.env_name) else 0
+
     # handle dataset
     def process_train_dataset(ds):
         """
@@ -144,19 +146,30 @@ def main(_):
         # Compute final_outcome per transition: 1.0 if the trajectory eventually succeeded,
         # 0.0 if it timed out.  Done after all reward transforms so we can detect success
         # via reward > -1e-6 (success step has reward 0.0, timeout has reward -1.0).
-        #
-        # For robomimic, `terminals` (= dones) marks ONLY success episode boundaries;
-        # timeout episodes have terminals=0 throughout.  Use `bsc_terminals` when available
-        # since it marks ALL episode boundaries (success AND timeout).
         ds_dict = {k: v for k, v in ds.items()}
-        boundary_field = 'bsc_terminals' if 'bsc_terminals' in ds_dict else 'terminals'
-        terminal_locs = np.nonzero(np.array(ds_dict[boundary_field]) > 0)[0]
+        terminal_locs = np.nonzero(np.array(ds_dict['terminals']) > 0)[0]
         traj_endpoints = np.concatenate([[0], terminal_locs + 1])
         traj_lengths = np.diff(traj_endpoints)
         success_flags = (np.array(ds_dict['rewards'])[terminal_locs] > -1e-6).astype(np.float32)
         final_outcomes = np.zeros(ds.size, dtype=np.float32)
         final_outcomes[:traj_endpoints[-1]] = np.repeat(success_flags, traj_lengths)
         ds_dict['final_outcome'] = final_outcomes
+
+        # num_chunks_to_timeout: chunks remaining before episode times out, from each step.
+        # num_chunks_to_success: chunks remaining until task success (-1 for failed trajectories).
+        H = FLAGS.horizon_length
+        num_chunks_to_timeout = np.zeros(ds.size, dtype=np.float32)
+        num_chunks_to_success = np.full(ds.size, -1.0, dtype=np.float32)
+        for i, (start, end_excl) in enumerate(zip(traj_endpoints[:-1], traj_endpoints[1:])):
+            traj_len = end_excl - start
+            local_steps = np.arange(traj_len)
+            if max_ep_len > 0:
+                num_chunks_to_timeout[start:end_excl] = np.ceil((max_ep_len - local_steps) / H)
+            if success_flags[i] == 1.0:
+                num_chunks_to_success[start:end_excl] = np.ceil((traj_len - local_steps) / H)
+        ds_dict['num_chunks_to_timeout'] = num_chunks_to_timeout
+        ds_dict['num_chunks_to_success'] = num_chunks_to_success
+
         ds = Dataset.create(**ds_dict)
 
         return ds
@@ -253,6 +266,8 @@ def main(_):
     from collections import defaultdict
     data = defaultdict(list)
     episode_ptrs = []  # replay buffer indices for the current episode
+    episode_steps = []  # env step index within current episode, per transition
+    ep_step = 0
     online_init_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.online_steps + 1)):
         log_step += 1
@@ -305,22 +320,32 @@ def main(_):
             actions=action,
             rewards=int_reward,
             terminals=float(done),
-            bsc_terminals=float(done),
             masks=1.0 - terminated,
             next_observations=next_ob,
-            final_outcome=0.0,  # placeholder; updated retroactively on episode end
+            final_outcome=0.0,           # placeholder; updated retroactively on episode end
+            num_chunks_to_timeout=float(np.ceil((max_ep_len - ep_step) / FLAGS.horizon_length)) if max_ep_len > 0 else 0.0,
+            num_chunks_to_success=-1.0,  # placeholder; updated retroactively on success
         )
         replay_buffer.add_transition(transition)
         episode_ptrs.append((replay_buffer.pointer - 1) % replay_buffer.max_size)
+        episode_steps.append(ep_step)
+        ep_step += 1
 
         # done
         if done:
-            # Retroactively label every transition in this episode with the final outcome.
+            # Retroactively label every transition in this episode.
             # terminated=True means the agent reached the goal; truncated=True means timeout.
             final_out = 1.0 if terminated else 0.0
-            for ptr in episode_ptrs:
+            ep_len = len(episode_ptrs)
+            for ptr, s in zip(episode_ptrs, episode_steps):
                 replay_buffer._dict['final_outcome'][ptr] = final_out
+                if terminated:
+                    replay_buffer._dict['num_chunks_to_success'][ptr] = float(
+                        np.ceil((ep_len - s) / FLAGS.horizon_length)
+                    )
             episode_ptrs = []
+            episode_steps = []
+            ep_step = 0
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
         else:
