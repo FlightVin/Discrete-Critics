@@ -147,8 +147,13 @@ def main(_):
         #   success terminal: terminals=1, masks=0
         #   timeout terminal: terminals=1, masks=1
         #   non-terminal: terminals=0, masks=1
-        # No need for final_outcome field; it's computed on-the-fly from these.
+        # final_outcome is computed on-the-fly from num_chunks_to_success >= 0.
         ds_dict = {k: v for k, v in ds.items()}
+        terminal_locs = np.nonzero(np.array(ds_dict['terminals']) > 0)[0]
+        traj_endpoints = np.concatenate([[0], terminal_locs + 1])
+        traj_lengths = np.diff(traj_endpoints)
+        # Success if final step's masks < 0.5 (masks = 1 - terminated)
+        success_flags = (np.array(ds_dict['masks'])[terminal_locs] < 0.5).astype(np.float32)
 
         # num_chunks_to_timeout: chunks remaining before episode times out, from each step.
         # num_chunks_to_success: chunks remaining until task success (-1 for failed trajectories).
