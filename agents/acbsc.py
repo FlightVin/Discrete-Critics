@@ -66,18 +66,20 @@ class ACBSCAgent(flax.struct.PyTreeNode):
         else:
             next_q = next_qs.mean(axis=0)
 
-        # Use explicit ground-truth fields: terminals and masks.
+        # Use explicit ground-truth fields: terminals, masks, and num_chunks_to_success.
         # masks = 1 - terminated, so:
         #   success terminal: terminals=1, masks=0
         #   timeout terminal: terminals=1, masks=1
         #   non-terminal: terminals=0, masks=1
+        # num_chunks_to_success >= 0 indicates trajectory succeeded, else timeout.
         bsc_is_terminal = batch['terminals'][..., -1] > 0.5
         bsc_is_success = bsc_is_terminal & (batch['masks'][..., -1] < 0.5)
+        trajectory_success = batch['num_chunks_to_success'] >= 0.0
 
         if self.config['use_mc_target']:
-            # Monte-Carlo target: use the known final outcome of the trajectory directly.
-            # For success trajectories every transition gets target 1.0; for timeout 0.0.
-            target_q = batch['final_outcome']
+            # Monte-Carlo target: use trajectory outcome for all transitions.
+            # Successful trajectories get target 1.0; timeout trajectories get 0.0.
+            target_q = trajectory_success.astype(jnp.float32)
         else:
             # Standard BSC TD target:
             #   terminal success  → 1.0
