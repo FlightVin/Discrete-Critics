@@ -141,14 +141,7 @@ class Dataset(FrozenDict):
         actions = batch_actions  # (batch_size, sequence_length, action_dim)
         next_actions = batch_next_actions  # (batch_size, sequence_length, action_dim)
         
-        # final_outcome: scalar per sampled sequence — the eventual success/failure of the
-        # trajectory that the starting index belongs to (1.0 = success, 0.0 = timeout).
-        # All transitions within the same trajectory share the same value, so indexing by
-        # the starting index is sufficient even for sequences that cross boundaries.
-        if 'final_outcome' in self:
-            final_outcome = self['final_outcome'][idxs]  # (batch_size,)
-        else:
-            final_outcome = np.zeros(batch_size, dtype=np.float32)
+        # final_outcome is no longer used; success/timeout is determined from terminals + masks
 
         if 'num_chunks_to_timeout' in self:
             num_chunks_to_timeout = self['num_chunks_to_timeout'][idxs]  # (batch_size,)
@@ -170,7 +163,6 @@ class Dataset(FrozenDict):
             valid=valid,
             next_observations=next_observations,
             next_actions=next_actions,
-            final_outcome=final_outcome,
             num_chunks_to_timeout=num_chunks_to_timeout,
             num_chunks_to_success=num_chunks_to_success,
         )

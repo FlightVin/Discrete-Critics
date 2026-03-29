@@ -150,6 +150,10 @@ class ACFQLAgent(flax.struct.PyTreeNode):
     @jax.jit
     def update(self, batch):
         return self._update(self, batch)
+
+    @jax.jit
+    def offline_update(self, batch):
+        return self._update(self, batch)
     
     @jax.jit
     def batch_update(self, batch):

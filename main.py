@@ -143,17 +143,12 @@ def main(_):
             ds_dict["rewards"] = sparse_rewards
             ds = Dataset.create(**ds_dict)
 
-        # Compute final_outcome per transition: 1.0 if the trajectory eventually succeeded,
-        # 0.0 if it timed out.  Done after all reward transforms so we can detect success
-        # via reward > -1e-6 (success step has reward 0.0, timeout has reward -1.0).
+        # Use terminals and masks directly: masks = 1 - terminated, so:
+        #   success terminal: terminals=1, masks=0
+        #   timeout terminal: terminals=1, masks=1
+        #   non-terminal: terminals=0, masks=1
+        # No need for final_outcome field; it's computed on-the-fly from these.
         ds_dict = {k: v for k, v in ds.items()}
-        terminal_locs = np.nonzero(np.array(ds_dict['terminals']) > 0)[0]
-        traj_endpoints = np.concatenate([[0], terminal_locs + 1])
-        traj_lengths = np.diff(traj_endpoints)
-        success_flags = (np.array(ds_dict['rewards'])[terminal_locs] > -1e-6).astype(np.float32)
-        final_outcomes = np.zeros(ds.size, dtype=np.float32)
-        final_outcomes[:traj_endpoints[-1]] = np.repeat(success_flags, traj_lengths)
-        ds_dict['final_outcome'] = final_outcomes
 
         # num_chunks_to_timeout: chunks remaining before episode times out, from each step.
         # num_chunks_to_success: chunks remaining until task success (-1 for failed trajectories).
@@ -327,7 +322,6 @@ def main(_):
             terminals=float(done),
             masks=1.0 - terminated,
             next_observations=next_ob,
-            final_outcome=0.0,           # placeholder; updated retroactively on episode end
             num_chunks_to_timeout=float(np.ceil((max_ep_len - ep_step) / FLAGS.horizon_length)) if max_ep_len > 0 else 0.0,
             num_chunks_to_success=-1.0,  # placeholder; updated retroactively on success
         )
@@ -338,13 +332,11 @@ def main(_):
 
         # done
         if done:
-            # Retroactively label every transition in this episode.
+            # Retroactively update num_chunks_to_success for successful episodes.
             # terminated=True means the agent reached the goal; truncated=True means timeout.
-            final_out = 1.0 if terminated else 0.0
             ep_len = len(episode_ptrs)
-            for ptr, s in zip(episode_ptrs, episode_steps):
-                replay_buffer._dict['final_outcome'][ptr] = final_out
-                if terminated:
+            if terminated:
+                for ptr, s in zip(episode_ptrs, episode_steps):
                     replay_buffer._dict['num_chunks_to_success'][ptr] = float(
                         np.ceil((ep_len - s) / FLAGS.horizon_length)
                     )
