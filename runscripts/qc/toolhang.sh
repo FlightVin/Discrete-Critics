@@ -23,6 +23,7 @@ env_name="tool_hang-ph-low_dim"
 sparse=True
 horizon_length=8
 start_training=40000
+online_steps=5000000
 n_eval_envs=32
 eval_episodes=2
 eval_interval=100000
@@ -53,6 +54,7 @@ python main.py \
     --sparse=$sparse \
     --horizon_length=$horizon_length \
     --start_training=$start_training \
+    --online_steps=$online_steps \
     --n_eval_envs=$n_eval_envs \
     --eval_episodes=$eval_episodes \
     --eval_interval=$eval_interval
