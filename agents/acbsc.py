@@ -99,8 +99,30 @@ class ACBSCAgent(flax.struct.PyTreeNode):
         critic_loss = optax.sigmoid_binary_cross_entropy(q_logit, target_q[None])
         critic_loss = (critic_loss * batch['valid'][..., -1][None]).mean()
 
-        return critic_loss, {
-            'critic_loss': critic_loss,
+        # Contrastive ranking loss: maximize log σ(f(s,a^+) - f(s,a^-)).
+        # a^+ = dataset action (batch_actions); a^- = random Gaussian action.
+        # Both are logits, so logit_diff directly feeds into the logistic loss.
+        if self.config['contrastive_loss']:
+            rng, neg_rng = jax.random.split(rng)
+            neg_actions = jax.random.normal(neg_rng, batch_actions.shape)
+            neg_actions = jnp.clip(neg_actions, -1, 1)
+            q_neg_logit = self.network.select('critic')(
+                batch['observations'], actions=neg_actions, params=grad_params
+            )
+            # Average over ensemble before computing the pairwise loss.
+            q_pos_mean = q_logit.mean(axis=0)     # (B,)
+            q_neg_mean = q_neg_logit.mean(axis=0)  # (B,)
+            contrastive_loss = -jnp.log(jax.nn.sigmoid(q_pos_mean - q_neg_mean))
+            contrastive_loss = (contrastive_loss * batch['valid'][..., -1]).mean()
+        else:
+            contrastive_loss = jnp.zeros(())
+
+        total_critic_loss = critic_loss + self.config['contrastive_loss_scale'] * contrastive_loss
+
+        return total_critic_loss, {
+            'critic_loss': total_critic_loss,
+            'bce_loss': critic_loss,
+            'contrastive_loss': contrastive_loss,
             'q': jax.nn.sigmoid(q_logit).mean(),
             'target_q': target_q.mean(),
             'success_frac': bsc_is_success.astype(jnp.float32).mean(),
@@ -437,6 +459,8 @@ def get_config():
             use_mc_target=False,    # If True, use the trajectory's final outcome (MC) as target for all
                                     # transitions instead of bootstrapping non-terminal steps via TD.
             train_critic_offline=True,  # If False, skip critic training during offline phase (actor/BC only).
+            contrastive_loss=False,       # If True, add pairwise ranking loss: maximize log σ(f(s,a^+) - f(s,a^-)).
+            contrastive_loss_scale=1.0,   # Scale of contrastive loss relative to BCE loss.
         )
     )
     return config

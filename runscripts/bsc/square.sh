@@ -28,6 +28,8 @@ horizon_length=5
 n_eval_envs=32
 eval_episodes=2
 eval_interval=100000
+contrastive_loss=False
+contrastive_loss_scale=1.0
 
 # === Parse CLI overrides (--key=value) ===
 for arg in "$@"; do
@@ -60,4 +62,6 @@ python main.py \
     --horizon_length=$horizon_length \
     --n_eval_envs=$n_eval_envs \
     --eval_episodes=$eval_episodes \
-    --eval_interval=$eval_interval
+    --eval_interval=$eval_interval \
+    --agent.contrastive_loss=$contrastive_loss \
+    --agent.contrastive_loss_scale=$contrastive_loss_scale
