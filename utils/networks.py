@@ -2,6 +2,7 @@ from typing import Any, Optional, Sequence
 
 import distrax
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
 
@@ -212,6 +213,105 @@ class Value(nn.Module):
         v = self.value_net(inputs).squeeze(-1)
 
         return v
+
+
+class CategoricalValue(nn.Module):
+    """Critic with logits over `num_bins` fixed bins instead of a scalar."""
+
+    hidden_dims: Sequence[int]
+    num_bins: int
+    layer_norm: bool = True
+    num_ensembles: int = 2
+    encoder: nn.Module = None
+
+    def setup(self):
+        mlp_class = MLP
+        if self.num_ensembles > 1:
+            mlp_class = ensemblize(mlp_class, self.num_ensembles)
+        self.value_net = mlp_class((*self.hidden_dims, self.num_bins), activate_final=False, layer_norm=self.layer_norm)
+
+    def __call__(self, observations, actions):
+        """Return logits (num_ensembles, ..., num_bins)."""
+        if self.encoder is not None:
+            observations = self.encoder(observations)
+        return self.value_net(jnp.concatenate([observations, actions], axis=-1))
+
+
+class CausalBlock(nn.Module):
+    """Pre-LN causal self-attention block."""
+
+    d_model: int
+    num_heads: int
+
+    @nn.compact
+    def __call__(self, x):
+        L = x.shape[-2]
+        mask = jnp.tril(jnp.ones((L, L), dtype=bool))
+        y = nn.LayerNorm()(x)
+        y = nn.MultiHeadDotProductAttention(num_heads=self.num_heads)(y, y, mask=mask)
+        x = x + y
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(4 * self.d_model, kernel_init=default_init())(y)
+        y = nn.Dense(self.d_model, kernel_init=default_init())(nn.gelu(y))
+        return x + y
+
+
+class ARCritic(nn.Module):
+    """Autoregressive binning critic: Q in [0, 1) as L base-B digits.
+
+    Token 0 is the (s, a) embedding from an MLP trunk; tokens 1..L-1 are the prefix digits.
+    The output at position l gives logits for digit l+1.
+    """
+
+    hidden_dims: Sequence[int]
+    base: int
+    length: int
+    d_model: int = 128
+    num_layers: int = 2
+    num_heads: int = 4
+    layer_norm: bool = True
+    encoder: nn.Module = None
+
+    def setup(self):
+        self.trunk = MLP((*self.hidden_dims, self.d_model), activate_final=False, layer_norm=self.layer_norm)
+        self.digit_embed = nn.Embed(self.base, self.d_model)
+        self.pos_embed = self.param('pos_embed', nn.initializers.normal(0.02), (self.length, self.d_model))
+        self.blocks = [CausalBlock(self.d_model, self.num_heads) for _ in range(self.num_layers)]
+        self.out_ln = nn.LayerNorm()
+        self.head = nn.Dense(self.base, kernel_init=default_init())
+
+    def _logits(self, h, digits):
+        tokens = jnp.concatenate([h[..., None, :], self.digit_embed(digits[..., :-1])], axis=-2)
+        x = tokens + self.pos_embed
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.out_ln(x))
+
+    def __call__(self, observations, actions, digits=None, rng=None):
+        """Returns one of:
+        - teacher-forced logits (..., L, B) if `digits` (..., L) is given. `digits` may carry an extra
+          code axis (..., K, L), giving logits (..., K, L, B) with the trunk shared across codes.
+        - K sampled codes (..., K, L) if `rng` is given, with K = rng.shape[0] (keys are only used for K).
+        - greedy digits (..., L) otherwise.
+        """
+        if self.encoder is not None:
+            observations = self.encoder(observations)
+        h = self.trunk(jnp.concatenate([observations, actions], axis=-1))
+
+        if digits is not None:
+            if digits.ndim == h.ndim + 1:
+                h = jnp.broadcast_to(h[..., None, :], (*digits.shape[:-1], h.shape[-1]))
+            return self._logits(h, digits)
+
+        if rng is not None:
+            h = jnp.broadcast_to(h[..., None, :], (*h.shape[:-1], rng.shape[0], h.shape[-1]))
+            keys = jax.random.split(rng[0], self.length)
+        digits = jnp.zeros((*h.shape[:-1], self.length), dtype=jnp.int32)
+        for l in range(self.length):
+            logits = self._logits(h, digits)[..., l, :]
+            z = jax.random.categorical(keys[l], logits) if rng is not None else jnp.argmax(logits, axis=-1)
+            digits = digits.at[..., l].set(z)
+        return digits
 
 
 class ActorVectorField(nn.Module):

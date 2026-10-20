@@ -1,8 +1,9 @@
 #!/bin/bash
-#SBATCH --partition=general
+#SBATCH --partition=maxlab
+#SBATCH --qos=maxlab_qos
 #SBATCH --job-name=QC
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=VRAM_48GB
+#SBATCH --constraint=VRAM_96GB
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=80G
 #SBATCH --time=48:00:00
@@ -11,12 +12,16 @@
 
 export MUJOCO_GL=egl
 export WANDB_ENTITY=RL-experiments
-cd /home/mananaga/BSC_branches/manan_qc/Binary-Success-Critic
+cd /home/mananaga/Discrete-Critics
+
+# OGPO uv env; ml_collections + robosuite 1.5.1 live in .pydeps
+PYTHON=/home/mananaga/ogpo/manan-libero-vla-fix/OGPO/.venv/bin/python
+export PYTHONPATH="/home/mananaga/Discrete-Critics/.pydeps:${PYTHONPATH:-}"
 
 # === Defaults ===
 run_group="QC"
 project_name="BSC"
-wandb_name="run-name"
+wandb_name="Square-QC"  # {Task}-{Method}[-variant]
 actor_type="best-of-n"
 actor_num_samples=32
 env_name="square-mh-low_dim"
@@ -42,7 +47,7 @@ for arg in "$@"; do
   esac
 done
 
-python main.py \
+$PYTHON main.py \
     --run_group=$run_group \
     --project_name=$project_name \
     --wandb_name=$wandb_name \

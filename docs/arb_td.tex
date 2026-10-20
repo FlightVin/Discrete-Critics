@@ -1,0 +1,47 @@
+\documentclass{article}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+
+\begin{document}
+
+\begin{algorithm}
+\caption{Autoregressive-Binning Critic TD}
+\label{alg:arb-td}
+\begin{algorithmic}[1]
+\Require Trainable critic $p_\theta$, target critic $p_{\bar\theta}$, actor $\pi$, base $B$, length $L$
+\Statex \textbf{Digit model:} $Q(s, a) \in [0, 1)$ is written as $L$ base-$B$ digits $z_{1:L}$, each $z_l \in \{0, \dots, B-1\}$
+\[
+  p_\theta(z_l \mid s, a, z_{<l}) = \mathrm{softmax}\big(\mathrm{CausalTransformer}_\theta([\mathrm{MLP}_\theta([s,\, a]),\, z_1, \dots, z_{l-1}])_l\big)
+\]
+\Statex \textbf{Decoding:} $\mathrm{dec}(z_{1:L}) = \sum_{l=1}^{L} z_l\, B^{-l}$, \quad
+  $Q_\theta(s, a) = \mathrm{dec}(\bar z_{1:L})$ with greedy digits $\bar z_l = \arg\max_{z}\, p_\theta(z \mid s, a, \bar z_{<l})$
+\Repeat
+  \State Sample batch $(s, a, s', \texttt{masks}, \texttt{terminals})$ from replay buffer
+  \State $a' \sim \pi(\cdot \mid s')$
+  \State $Q^{\text{next}} \gets Q_{\bar\theta}(s', a')$ \Comment{greedy decode of target network, no gradient}
+  \State \textbf{Compute BSC target:}
+  \[
+    \hat{y} =
+    \begin{cases}
+      1.0        & \text{if } \texttt{masks} = 0 \quad \text{(success)} \\
+      0.0        & \text{if } \texttt{terminals} \cdot \texttt{masks} = 1 \quad \text{(timeout)} \\
+      Q^{\text{next}} & \text{otherwise} \quad \text{(non-terminal bootstrap)}
+    \end{cases}
+  \]
+  \State \textbf{Bin target into digits} (round down, $1$ is clipped to the largest code):
+  \[
+    \hat{y} \gets \min\big(\hat{y},\, 1 - B^{-L}\big), \qquad
+    n = \big\lfloor \hat{y}\, B^{L} \big\rfloor, \qquad
+    y_l = \big\lfloor n / B^{L-l} \big\rfloor \bmod B, \quad l = 1, \dots, L
+  \]
+  \State \textbf{Update critic} by minimising teacher-forced cross-entropy over digits:
+  \[
+    \mathcal{L}(\theta) = -\frac{1}{L} \sum_{l=1}^{L} \log p_\theta\big(y_l \mid s, a, y_{<l}\big)
+  \]
+  \State \textbf{Update target network:} $\bar\theta \gets (1 - \tau)\,\bar\theta + \tau\,\theta$
+\Until{converged}
+\end{algorithmic}
+\end{algorithm}
+
+\end{document}
