@@ -1,4 +1,4 @@
-"""Plot eval/success for the {Square,Toolhang}-{QC,BSC,ARB} wandb runs.
+"""Plot eval/success for the {Square,Toolhang}-{QC,BSC,ARB,CAT} wandb runs.
 
 Usage: python visualization/plot_eval_success.py [--out PATH]
 """
@@ -14,8 +14,9 @@ import wandb
 ENTITY = 'RL-experiments'
 PROJECT = 'BSC'
 TASKS = ['Square', 'Toolhang']
-METHODS = ['QC', 'BSC', 'ARB']
-LABELS = {'QC': 'QC', 'BSC': 'Binary-Success Critic', 'ARB': 'Autoregressive Binning'}
+METHODS = ['QC', 'BSC', 'ARB', 'CAT']
+LABELS = {'QC': 'QC', 'BSC': 'Binary-Success Critic', 'ARB': 'Autoregressive Binning',
+          'CAT': 'Categorical Critic (Two-Hot)'}
 OFFLINE_STEPS = 1_000_000
 
 
