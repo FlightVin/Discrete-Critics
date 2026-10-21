@@ -70,8 +70,14 @@ def setup_wandb(
     name=None,
     mode='online',
 ):
-    """Set up Weights & Biases for logging."""
-    wandb_output_dir = tempfile.mkdtemp()
+    """Set up Weights & Biases for logging.
+
+    WANDB_MODE overrides `mode`. If an online init fails, fall back to offline so training continues;
+    set WANDB_DIR to a persistent path so the offline run can be uploaded later with `wandb sync`.
+    """
+    mode = os.environ.get('WANDB_MODE', mode)
+    wandb_output_dir = os.environ.get('WANDB_DIR') or tempfile.mkdtemp()
+    os.makedirs(wandb_output_dir, exist_ok=True)
     tags = [group] if group is not None else None
 
     init_kwargs = dict(
@@ -89,7 +95,15 @@ def setup_wandb(
         mode=mode,
     )
 
-    run = wandb.init(**init_kwargs)
+    try:
+        run = wandb.init(**init_kwargs)
+    except Exception as e:
+        if mode != 'online':
+            raise
+        print(f'WANDB_FALLBACK_OFFLINE: online init failed ({type(e).__name__}: {e}); '
+              f'logging offline to {wandb_output_dir}', flush=True)
+        init_kwargs['mode'] = 'offline'
+        run = wandb.init(**init_kwargs)
 
     # assume a flat structure
     run.save('*.py')
