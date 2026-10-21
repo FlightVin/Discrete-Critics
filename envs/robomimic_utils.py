@@ -74,12 +74,12 @@ def _check_dataset_exists(env_name):
     else:
         file_name = "low_dim_v15.hdf5"
     download_folder = os.path.join(
-        "/data/user_data/mananaga/robomimic",
+        os.environ.get("ROBOMIMIC_DATA_DIR", "/data/user_data/mananaga/robomimic"),
         task,
         dataset_type,
         file_name
     )
-    assert os.path.exists(download_folder)
+    assert os.path.exists(download_folder), download_folder
     
     return download_folder
 
