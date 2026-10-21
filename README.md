@@ -22,7 +22,10 @@ Q-chunking runs RL on a *temporally extended action (action chunking) space* wit
 ## Installation
 ```bash
 pip install -r requirements.txt
+# robomimic (square, tool_hang): not on PyPI, and its pins conflict with this jax; install without deps.
+pip install --no-deps "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@e10526b9a40c78b41f1e37e60041dc0ec0a5f60f"
 ```
+Set `ROBOMIMIC_DATA_DIR` to the directory that holds `<task>/<mh|ph>/low_dim_v15.hdf5`.
 
 
 ## Datasets
