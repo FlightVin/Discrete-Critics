@@ -4,7 +4,7 @@ attrs==25.3.0
 certifi==2025.1.31
 charset-normalizer==3.4.1
 chex==0.1.89
-click==8.1.8
+click==8.5.0
 cloudpickle==3.1.1
 decorator==5.2.1
 distrax==0.1.5
@@ -57,7 +57,7 @@ optax==0.2.4
 orbax-checkpoint==0.11.12
 pillow==11.2.1
 platformdirs==4.3.7
-protobuf==5.29.4
+protobuf==7.36.2
 psutil==7.0.0
 pydantic==2.11.3
 pydantic_core==2.33.1
@@ -79,9 +79,9 @@ toolz==1.0.0
 tqdm==4.67.1
 treescope==0.1.9
 typing-inspection==0.4.0
-typing_extensions==4.13.2
+typing_extensions==4.16.0
 urllib3==2.4.0
-wandb==0.19.9
+wandb==0.31.0  # 0.19.9 rejects the new 86-character API keys
 wrapt==1.17.2
 zipp==3.21.0
 
