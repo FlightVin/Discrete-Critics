@@ -84,3 +84,22 @@ urllib3==2.4.0
 wandb==0.19.9
 wrapt==1.17.2
 zipp==3.21.0
+
+# --- robomimic / robosuite stack (square, tool_hang). Verified on Babel, Python 3.12, 2026-10-21.
+# robomimic 0.5.0 is not on PyPI, and its metadata pins diffusers==0.11.1, which fails on this jax
+# (jax.random.KeyArray). Install it separately without deps, after this file:
+#   pip install --no-deps "robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@e10526b9a40c78b41f1e37e60041dc0ec0a5f60f"
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu  # robomimic imports torch; CPU build keeps torch's CUDA libs away from jax
+torchvision==0.29.1+cpu
+robosuite==1.5.1
+h5py==3.16.0
+matplotlib==3.11.2
+diffusers==0.35.2
+huggingface-hub==0.36.0
+transformers==4.57.1
+termcolor==3.3.0
+tensorboard==2.20.0
+tensorboardX==2.6.5
+imageio-ffmpeg==0.6.0
+egl-probe==1.0.2
