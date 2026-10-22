@@ -483,17 +483,21 @@ class Trainer:
         if self.mode == 'online':
             with open(FLAGS.init_actor, 'rb') as f:
                 blob = pickle.load(f)
-            # The actor modules are the same in every agent; the BC run may have used any of them.
+            # The BC run may have used any agent: copy this agent's actor modules (same networks in every
+            # agent); modules this agent lacks (acbsc's unused one-step flow for acarb) are ignored.
             assert blob['horizon_length'] == self.H, (blob['horizon_length'], self.H)
             params = dict(agent.network.params)
-            assert set(blob['actor_params']) == set(_modules(params, critic=False)), \
-                (sorted(blob['actor_params']), sorted(params))
-            for k, v in blob['actor_params'].items():
+            need = _modules(params, critic=False)
+            assert set(need) <= set(blob['actor_params']), (sorted(blob['actor_params']), sorted(params))
+            ignored = sorted(set(blob['actor_params']) - set(need))
+            for k in need:
+                v = blob['actor_params'][k]
                 shapes = lambda t: jax.tree_util.tree_map(np.shape, t)  # noqa: E731
                 assert shapes(v) == shapes(params[k]), k
                 params[k] = jax.tree_util.tree_map(jnp.asarray, v)
             agent = agent.replace(network=agent.network.replace(params=params))
-            self.init_actor_info = dict(path=FLAGS.init_actor, agent_name=blob['agent_name'],
+            self.init_actor_info = dict(path=FLAGS.init_actor, agent_name=blob['agent_name'], loaded=need,
+                                        ignored=ignored,
                                         **{k: blob[k] for k in ('bc_steps', 'seed', 'source') if k in blob})
         self.agent = split_optimizer(agent)  # fresh: both step counts 0
 
