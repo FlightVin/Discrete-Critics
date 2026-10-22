@@ -12,30 +12,41 @@ from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, CategoricalValue
 
 
-def two_hot(y, support):
-    """Split y between its two neighbouring bins so that E[support] = y (y clipped to the support)."""
-    y = jnp.clip(y, support[0], support[-1])
-    idx = jnp.clip(jnp.searchsorted(support, y, side='right') - 1, 0, len(support) - 2)
-    lo, hi = support[idx], support[idx + 1]
-    w_hi = (y - lo) / (hi - lo)
-    n = len(support)
-    return jax.nn.one_hot(idx, n) * (1 - w_hi)[..., None] + jax.nn.one_hot(idx + 1, n) * w_hi[..., None]
+def hl_gauss(y, edges, sigma):
+    """HL-Gauss target (Stop Regressing, arXiv 2403.03950 App. A): mass of N(y, sigma^2) in each bin,
+    renormalised to the support. `edges` are the num_bins + 1 bin edges.
+
+    y is clipped to [edges[0], edges[-1]] first: for y far outside the support every erf saturates
+    and the normaliser z -> 0 (0/0). After clipping z >= ~0.5, and in-support targets are unchanged.
+    """
+    y = jnp.clip(y, edges[0], edges[-1])
+    cdf = jax.scipy.special.erf((edges - y[..., None]) / (jnp.sqrt(2.0) * sigma))
+    z = cdf[..., -1] - cdf[..., 0]
+    return (cdf[..., 1:] - cdf[..., :-1]) / z[..., None]
 
 
-class ACCATAgent(flax.struct.PyTreeNode):
-    """ACFQL with a categorical critic.
+class ACHLGAgent(flax.struct.PyTreeNode):
+    """ACFQL with an HL-Gauss categorical critic.
 
     Same TD target as ACFQL, but the critic outputs probabilities over `num_bins` bins spanning
-    [-1/(1-discount), 0] and is trained by cross-entropy against the two-hot target. Q is the
-    expected value under those probabilities.
+    [-1/(1-discount), 0] and is trained by cross-entropy against the HL-Gauss target (sigma =
+    hl_sigma_ratio * bin width). Q is the expected bin centre under those probabilities.
     """
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
+    def edges(self):
+        return jnp.linspace(-1.0 / (1.0 - self.config['discount']), 0.0, self.config['num_bins'] + 1, dtype=jnp.float32)
+
     def support(self):
-        return jnp.linspace(-1.0 / (1.0 - self.config['discount']), 0.0, self.config['num_bins'])
+        """Bin centres."""
+        e = self.edges()
+        return (e[:-1] + e[1:]) / 2
+
+    def sigma(self):
+        return self.config['hl_sigma_ratio'] / (1.0 - self.config['discount']) / self.config['num_bins']
 
     def critic_value(self, observations, actions, target=False, params=None):
         """Expected Q of each ensemble member, shape (num_qs, ...)."""
@@ -43,7 +54,7 @@ class ACCATAgent(flax.struct.PyTreeNode):
         return (jax.nn.softmax(logits, axis=-1) * self.support()).sum(-1)
 
     def critic_loss(self, batch, grad_params, rng):
-        """Compute the categorical critic loss."""
+        """Compute the HL-Gauss critic loss."""
 
         if self.config["action_chunking"]:
             batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
@@ -64,7 +75,7 @@ class ACCATAgent(flax.struct.PyTreeNode):
             (self.config['discount'] ** self.config["horizon_length"]) * batch['masks'][..., -1] * next_q
 
         logits = self.network.select('critic')(batch['observations'], batch_actions, params=grad_params)
-        ce = optax.softmax_cross_entropy(logits, two_hot(target_q, self.support()))  # (num_qs, batch)
+        ce = optax.softmax_cross_entropy(logits, hl_gauss(target_q, self.edges(), self.sigma()))  # (num_qs, batch)
         critic_loss = (ce.mean(axis=0) * batch['valid'][..., -1]).mean()
 
         probs = jax.nn.softmax(logits, axis=-1)
@@ -349,7 +360,7 @@ def get_config():
 
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='accat',  # Agent name.
+            agent_name='achlg',  # Agent name.
             ob_dims=ml_collections.config_dict.placeholder(list),  # Observation dimensions (will be set automatically).
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (will be set automatically).
             lr=3e-4,  # Learning rate.
@@ -373,7 +384,8 @@ def get_config():
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
-            num_bins=101,  # Bins over [-1/(1-discount), 0].
+            num_bins=101,  # Bins over [-1/(1-discount), 0] (num_bins + 1 edges).
+            hl_sigma_ratio=0.75,  # HL-Gauss sigma / bin width.
         )
     )
     return config
