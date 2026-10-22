@@ -15,6 +15,7 @@ Usage (from the project root):
 """
 import argparse
 import glob
+import inspect
 import json
 import os
 import re
@@ -34,16 +35,20 @@ from utils.flax_utils import restore_agent_with_file
 
 
 def q_values(agent, observations, actions, rng):
-    """Ensemble-aggregated Q, as best-of-n uses it."""
+    """Ensemble-aggregated Q, as best-of-n uses it.
+
+    Agents with critic_value (accat, achlg: expected value over the bin support; acarb: with rng) use it;
+    acbsc's critic outputs logits (sigmoid), acfql's the Q itself."""
     name = agent.config['agent_name']
-    if name == 'acbsc':
+    if hasattr(agent, 'critic_value'):
+        if 'rng' in inspect.signature(agent.critic_value).parameters:
+            qs = agent.critic_value(observations, actions, rng=rng)
+        else:
+            qs = agent.critic_value(observations, actions)
+    elif name == 'acbsc':
         qs = jax.nn.sigmoid(agent.network.select('critic')(observations, actions))
     elif name == 'acfql':
         qs = agent.network.select('critic')(observations, actions)
-    elif name == 'accat':
-        qs = agent.critic_value(observations, actions)
-    elif name == 'acarb':
-        qs = agent.critic_value(observations, actions, rng=rng)
     else:
         raise ValueError(f'unsupported agent {name}')
     return qs.min(axis=0) if agent.config['q_agg'] == 'min' else qs.mean(axis=0)
