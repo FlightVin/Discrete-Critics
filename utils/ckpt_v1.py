@@ -61,6 +61,7 @@ class CheckpointStore:
         self.gen = None          # committed generation number
         self.segments = {}       # buffer name -> list of segment entries of the committed generation
         self.fail_at = None      # tests: raise SimulatedCrash at this stage of save()
+        self.test_delay = 0.0    # tests: seconds to sleep mid-save (between segments and state)
 
     # ---- reading --------------------------------------------------------------------------------
     def latest(self):
@@ -149,6 +150,8 @@ class CheckpointStore:
             segments[buf].append(dict(file=fname, k_from=int(a), k_to=int(b), size=size, crc=rows_crc(rows)))
             self._maybe_crash('after_segment')
         _fsync_dir(self.seg_dir)
+        if self.test_delay:
+            time.sleep(self.test_delay)
         t_seg = time.time()
 
         blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)

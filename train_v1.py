@@ -239,11 +239,13 @@ class Trainer:
         self.stop_requested = False
         self.t_sigterm = None
         self.pid = os.getpid()
+        self.done_msg = None
         signal.signal(signal.SIGTERM, self._on_sigterm)
 
         self.run_dir = FLAGS.run_dir
         os.makedirs(self.run_dir, exist_ok=True)
         self.store = CheckpointStore(os.path.join(self.run_dir, 'ckpt'))
+        self.store.test_delay = float(os.environ.get('V1_TEST_CKPT_DELAY', 0))  # e2e test: widen the write
         self.mode = FLAGS.mode
         self.phases = ONLINE_PHASES if self.mode == 'online' else BC_PHASES
 
@@ -420,6 +422,9 @@ class Trainer:
         due = (time.time() - self.t_last_ckpt) > FLAGS.ckpt_minutes * 60
         if self.stop_requested or force or due:
             self.checkpoint(force or ('sigterm' if self.stop_requested else 'periodic'))
+            if self.done_msg:  # the phase is committed as complete only now
+                print(self.done_msg, flush=True)
+                self.done_msg = None
         if self.stop_requested:
             self.exit_preempted()
 
@@ -570,6 +575,9 @@ class Trainer:
         self.env_acc = defaultdict(list)
 
     # ---- phases ---------------------------------------------------------------------------------
+    def progress(self, msg):
+        print(f'PROGRESS {msg} t={time.time() - self.t_start:.1f}', flush=True)
+
     def finish_phase(self):
         nxt = self.phases[self.phases.index(self.phase) + 1]
         done = self.phase
@@ -577,8 +585,8 @@ class Trainer:
         self.metrics.log('phase_end', self.ctr['env_steps'] or self.ctr['bc_updates'],
                          dict(phase=done, **{k: v for k, v in self.ctr.items()}))
         self.phase = nxt
+        self.done_msg = f'PHASE_DONE {done}'
         self.safe_point(force='phase_end')
-        print(f'PHASE_DONE {done}', flush=True)
 
     def run(self):
         while self.phase != 'done':
@@ -603,7 +611,7 @@ class Trainer:
             u += 1
             if u % FLAGS.log_interval == 0 or u == n:
                 self.metrics.log('bc', u, jax.device_get(info))
-                print(f'PROGRESS bc updates={u}', flush=True)
+                self.progress(f'bc updates={u}')
         # final_actor.pkl, written atomically; kept permanently.
         blob = dict(actor_params=actor_params(self.agent), agent_name=self.agent.config['agent_name'],
                     env_name=FLAGS.env_name, horizon_length=self.H, bc_steps=n, seed=FLAGS.seed)
@@ -624,7 +632,7 @@ class Trainer:
             self.env_step('n1')
             if self.ctr['env_steps'] % FLAGS.log_interval == 0:
                 self.log_env(self.ctr['env_steps'])
-                print(f'PROGRESS warmup env_steps={self.ctr["env_steps"]}', flush=True)
+                self.progress(f'warmup env_steps={self.ctr["env_steps"]}')
         self.log_env(self.ctr['env_steps'])
 
     def phase_pretrain(self):
@@ -637,7 +645,7 @@ class Trainer:
             u = self.ctr['pretrain_updates']
             if u % FLAGS.log_interval == 0 or u == FLAGS.pretrain_updates:
                 self.metrics.log('pretrain', self.ctr['env_steps'], dict(updates=u, **jax.device_get(info)))
-                print(f'PROGRESS pretrain updates={u}', flush=True)
+                self.progress(f'pretrain updates={u}')
 
     def phase_pretrain_eval(self):
         res = self.evaluate(['n1', 'bon'])
@@ -671,7 +679,7 @@ class Trainer:
             if s % FLAGS.log_interval == 0:
                 self.metrics.log('joint', s, dict(updates=self.ctr['joint_updates'], **jax.device_get(info)))
                 self.log_env(s)
-                print(f'PROGRESS joint env_steps={s}', flush=True)
+                self.progress(f'joint env_steps={s}')
         # Reaching online_steps is a safe point (no further env interaction), even mid-episode.
         self.ob, self.action_queue, self.ep_rows = None, [], []
         if self.last_eval < end:
