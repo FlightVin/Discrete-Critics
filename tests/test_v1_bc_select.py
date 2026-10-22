@@ -136,7 +136,8 @@ def test_disabled_flag_matches_previous_train_v1(runs):
     assert sorted(os.listdir(d_off)) == sorted(os.listdir(d_base))
     assert stable(rows(d_off)) == stable(rows(d_base))
     assert read(os.path.join(d_off, 'final_actor.pkl')) == read(os.path.join(d_base, 'final_actor.pkl'))
-    assert read(os.path.join(d_off, 'args.json')) == read(os.path.join(d_base, 'args.json'))
+    args = [json.load(open(os.path.join(x, 'args.json'))) for x in (d_off, d_base)]
+    assert args[0].pop('run_dir') != args[1].pop('run_dir') and args[0] == args[1]  # no bc_select_threshold
     assert 'BEST_ACTOR_WRITTEN' not in off['out']
 
 
