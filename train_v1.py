@@ -381,12 +381,12 @@ class Trainer:
 
     def checkpoint(self, reason):
         print(f'CKPT_BEGIN phase={self.phase} reason={reason}', flush=True)
-        state = self.state_dict()
         segs, keep = {}, {}
         if self.mode == 'online':
             for k, b in self.buffers.items():
-                segs[k] = b.new_segment()
+                segs[k] = b.new_segment()  # before state_dict(): the saved meta must include it
                 keep[k] = b.k_lo
+        state = self.state_dict()
         info = self.store.save(state, segs, keep, meta=dict(phase=self.phase, ctr=dict(self.ctr)))
         self.t_last_ckpt = time.time()
         print(f'CKPT_DONE gen={info["gen"]} reason={reason} state_mb={info["state_bytes"] / 1e6:.1f} '
