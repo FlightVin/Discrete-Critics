@@ -1,7 +1,13 @@
 """v1 protocol: resumable BC preparation and online training with two replay buffers.
 
   --mode=bc      actor-only BC on the demos for --bc_steps updates; n1 eval every --eval_interval and at
-                 the end; writes <run_dir>/final_actor.pkl.
+                 the end; writes <run_dir>/final_actor.pkl. With --bc_select_threshold=T >= 0 (actor
+                 selection): BC stops at the first evaluation whose n1 success rate is > T; else (budget
+                 reached) the evaluated actor with the highest rate, the earliest on ties, is selected.
+                 The best candidate so far is kept in <run_dir>/best_actor.pkl (and in the checkpointed
+                 state); at the end <run_dir>/selected_actor.pkl and selection.json are written.
+  --mode=eval_actor  one n1 evaluation of --init_actor (agent, eval envs and seeding as in --mode=bc);
+                 writes <run_dir>/eval_actor.json. No training, no checkpoints; W&B only with --project_name.
   --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
                  --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
                  fresh optimisers; then phases
@@ -66,10 +72,12 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('mode', 'online', ['bc', 'online'], 'bc: shared BC preparation run; online: one method run.')
+flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor'],
+                  'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor.')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
-flags.DEFINE_string('init_actor', None, 'online: path to final_actor.pkl from the bc run.')
+flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
+                    'from the bc run.')
 flags.DEFINE_string('env_name', 'square-mh-low_dim', 'Environment (dataset) name.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_integer('horizon_length', 5, 'Action chunk length H.')
@@ -77,6 +85,8 @@ flags.DEFINE_bool('sparse', True, 'Sparse reward.')
 flags.DEFINE_float('discount', 0.99, 'Discount used by sample_sequence for cumulative rewards.')
 
 flags.DEFINE_integer('bc_steps', 1000000, 'bc: actor BC updates.')
+flags.DEFINE_float('bc_select_threshold', -1.0, 'bc: stop at the first n1 evaluation with success rate > this and '
+                   'select that actor, else the best evaluated one (earliest on ties). < 0: disabled.')
 flags.DEFINE_integer('warmup_steps', 50000, 'online: warm-up env steps (n1 actions, no updates).')
 flags.DEFINE_integer('pretrain_updates', 50000, 'online: critic-only updates after warm-up.')
 flags.DEFINE_integer('online_steps', 1000000, 'online: total online env steps, warm-up included.')
@@ -112,6 +122,8 @@ config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 
 # Flags that may change between restarts of the same run.
 RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval', 'preempt_budget_s'}
+# Flags added after runs were started: left out of args.json at their default (older run dirs still resume).
+LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0}
 EXIT_PREEMPTED = 143
 ONLINE_PHASES = ['warmup', 'pretrain', 'pretrain_eval', 'joint', 'done']
 BC_PHASES = ['bc', 'done']
@@ -284,6 +296,44 @@ def actor_params(agent):
     return {k: jax.device_get(v) for k, v in agent.network.params.items() if 'critic' not in k}
 
 
+def load_actor(agent, path, H):
+    """agent with its actor modules replaced by those of a BC actor blob (final / best / selected_actor.pkl).
+
+    The BC run may have used any agent: copy this agent's actor modules (same networks in every agent);
+    modules this agent lacks (acbsc's unused one-step flow for acarb) are ignored. Returns (agent, info)."""
+    with open(path, 'rb') as f:
+        blob = pickle.load(f)
+    assert blob['horizon_length'] == H, (blob['horizon_length'], H)
+    params = dict(agent.network.params)
+    need = _modules(params, critic=False)
+    assert set(need) <= set(blob['actor_params']), (sorted(blob['actor_params']), sorted(params))
+    ignored = sorted(set(blob['actor_params']) - set(need))
+    for k in need:
+        v = blob['actor_params'][k]
+        shapes = lambda t: jax.tree_util.tree_map(np.shape, t)  # noqa: E731
+        assert shapes(v) == shapes(params[k]), k
+        params[k] = jax.tree_util.tree_map(jnp.asarray, v)
+    agent = agent.replace(network=agent.network.replace(params=params))
+    info = dict(path=path, agent_name=blob['agent_name'], loaded=need, ignored=ignored,
+                **{k: blob[k] for k in ('bc_steps', 'seed', 'source', 'selected_update', 'selection_rule')
+                   if k in blob})
+    return agent, info
+
+
+def file_sha256(path):
+    import hashlib
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def write_atomic(path, data):
+    with open(path + '.tmp', 'wb') as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + '.tmp', path)
+
+
 def process_demos(ds, env_name, H, sparse):
     """main.py process_train_dataset for robomimic (dataset_proportion 1): rewards - 1, sparse, chunk counts."""
     d = {k: np.asarray(v) for k, v in ds.items()}
@@ -396,9 +446,11 @@ class Trainer:
 
         self.run_dir = FLAGS.run_dir
         os.makedirs(self.run_dir, exist_ok=True)
-        self.store = CheckpointStore(os.path.join(self.run_dir, 'ckpt'))
-        self.store.test_delay = float(os.environ.get('V1_TEST_CKPT_DELAY', 0))  # e2e test: widen the write
         self.mode = FLAGS.mode
+        self.store = None
+        if self.mode != 'eval_actor':  # eval_actor: no checkpoints
+            self.store = CheckpointStore(os.path.join(self.run_dir, 'ckpt'))
+            self.store.test_delay = float(os.environ.get('V1_TEST_CKPT_DELAY', 0))  # e2e test: widen the write
         self.phases = ONLINE_PHASES if self.mode == 'online' else BC_PHASES
 
     def _on_sigterm(self, signum, frame):
@@ -428,11 +480,12 @@ class Trainer:
         with self.ckpt_lock:  # never cut a checkpoint write short (harmless, but it would be wasted)
             dt = time.time() - self.t_stop_ref
             print(f'EXIT_PREEMPTED_UNSAVED source={self.stop_source} notice_to_exit_s={dt:.2f} '
-                  f'phase={self.phase_name()} committed_gen={self.store.gen}', flush=True)
+                  f'phase={self.phase_name()} committed_gen={getattr(self.store, "gen", None)}', flush=True)
             try:
                 with open(os.path.join(self.run_dir, 'preemptions.jsonl'), 'a') as f:
                     f.write(json.dumps(dict(time=time.time(), source=self.stop_source, unsaved=True,
-                                            notice_to_exit_s=round(dt, 3), gen=self.store.gen)) + '\n')
+                                            notice_to_exit_s=round(dt, 3),
+                                            gen=getattr(self.store, 'gen', None))) + '\n')
                 for proc in getattr(getattr(self, 'eval_envs', None), 'processes', []):
                     proc.terminate()
             finally:
@@ -445,7 +498,8 @@ class Trainer:
     # ---- setup ----------------------------------------------------------------------------------
     def check_args(self):
         """Refuse to resume a run directory with different arguments."""
-        flag_dict = {k: v for k, v in get_flag_dict().items() if k not in RESTART_FREE_FLAGS}
+        flag_dict = {k: v for k, v in get_flag_dict().items() if k not in RESTART_FREE_FLAGS
+                     and not (k in LATER_FLAG_DEFAULTS and v == LATER_FLAG_DEFAULTS[k])}
         path = os.path.join(self.run_dir, 'args.json')
         if os.path.exists(path):
             with open(path) as f:
@@ -461,7 +515,8 @@ class Trainer:
             os.replace(path + '.tmp', path)
 
     def setup(self):
-        self.check_args()
+        if self.mode != 'eval_actor':
+            self.check_args()
         config = resolve_agent_config(FLAGS.method, FLAGS.agent, sys.argv)
         config['horizon_length'] = FLAGS.horizon_length
         check_agent_config(self.mode, config)
@@ -480,25 +535,8 @@ class Trainer:
         agent = agents[config['agent_name']].create(
             FLAGS.seed, self.demos['observations'][0], self.demos['actions'][0], config)
         self.init_actor_info = None
-        if self.mode == 'online':
-            with open(FLAGS.init_actor, 'rb') as f:
-                blob = pickle.load(f)
-            # The BC run may have used any agent: copy this agent's actor modules (same networks in every
-            # agent); modules this agent lacks (acbsc's unused one-step flow for acarb) are ignored.
-            assert blob['horizon_length'] == self.H, (blob['horizon_length'], self.H)
-            params = dict(agent.network.params)
-            need = _modules(params, critic=False)
-            assert set(need) <= set(blob['actor_params']), (sorted(blob['actor_params']), sorted(params))
-            ignored = sorted(set(blob['actor_params']) - set(need))
-            for k in need:
-                v = blob['actor_params'][k]
-                shapes = lambda t: jax.tree_util.tree_map(np.shape, t)  # noqa: E731
-                assert shapes(v) == shapes(params[k]), k
-                params[k] = jax.tree_util.tree_map(jnp.asarray, v)
-            agent = agent.replace(network=agent.network.replace(params=params))
-            self.init_actor_info = dict(path=FLAGS.init_actor, agent_name=blob['agent_name'], loaded=need,
-                                        ignored=ignored,
-                                        **{k: blob[k] for k in ('bc_steps', 'seed', 'source') if k in blob})
+        if self.mode in ('online', 'eval_actor'):
+            agent, self.init_actor_info = load_actor(agent, FLAGS.init_actor, self.H)
         self.agent = split_optimizer(agent)  # fresh: both step counts 0
 
         # Eval envs before seeding/restoring: AsyncVectorEnv builds a dummy env in this process, and
@@ -506,6 +544,8 @@ class Trainer:
         np_state = np.random.get_state()
         self.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, FLAGS.n_eval_envs, seed=FLAGS.eval_seed)
         np.random.set_state(np_state)
+        if self.mode == 'eval_actor':
+            return
 
         random.seed(FLAGS.seed)
         np.random.seed(FLAGS.seed)
@@ -534,6 +574,12 @@ class Trainer:
         self.env_acc = defaultdict(list)
         self.metrics_offset = 0
         self.wandb_id = None
+        # Actor selection (bc): every n1 evaluation [update, successes, episodes, rate]; the best candidate
+        # (also its pickled blob, so best_actor.pkl can be rewritten on resume); stopped: rate > threshold.
+        self.bc_select = None
+        if self.mode == 'bc' and FLAGS.bc_select_threshold >= 0:
+            self.bc_select = dict(threshold=float(FLAGS.bc_select_threshold), evals=[], best=None,
+                                  best_blob=None, stopped=False)
         self.restore()
 
         self.metrics = MetricsLog(os.path.join(self.run_dir, 'metrics.jsonl'), self.metrics_offset)
@@ -580,6 +626,8 @@ class Trainer:
         if self.mode == 'online':
             state['buffers'] = {k: b.meta() for k, b in self.buffers.items()}
             state['demo_crc'] = self.demo_crc()
+        if self.bc_select is not None:
+            state['bc_select'] = self.bc_select
         return state
 
     def demo_crc(self):
@@ -621,7 +669,23 @@ class Trainer:
             assert state['demo_crc'] == self.demo_crc(), 'demo data differ from the checkpointed run'
             for k, b in self.buffers.items():
                 b.restore(state['buffers'][k], self.store.iter_segments(k))
+        if self.bc_select is not None:
+            self.bc_select = state['bc_select']
+            self.restore_best_actor()
         print(f'RESUME gen={man["gen"]} phase={self.phase} ctr={dict(self.ctr)}', flush=True)
+
+    def restore_best_actor(self):
+        """best_actor.pkl = the checkpointed best candidate. A process killed after writing a new candidate
+        and before the next checkpoint left a newer one on disk: put the committed one back (the resumed
+        run redoes that evaluation and writes the newer one again)."""
+        best = self.bc_select['best']
+        if best is None:
+            return  # no committed candidate; the first evaluation overwrites any file left on disk
+        path = os.path.join(self.run_dir, 'best_actor.pkl')
+        sha = file_sha256(path) if os.path.exists(path) else None
+        if sha != best['sha256']:
+            write_atomic(path, self.bc_select['best_blob'])
+            print(f'BEST_ACTOR_RESTORED update={best["update"]} (file on disk: {sha})', flush=True)
 
     def safe_point(self, force=None):
         """Called only where the state is fully defined by state_dict() + replay."""
@@ -722,6 +786,8 @@ class Trainer:
         res = self.evaluate(rules)
         if res is None:
             self.safe_point()
+        if self.bc_select is not None:
+            self.bc_select_update(nominal, res['n1'])
         row = {'nominal_step': nominal, 'phase': self.phase}
         for rule, r in res.items():
             row.update({f'{rule}/{k}': v for k, v in r.items()})
@@ -835,7 +901,7 @@ class Trainer:
             u = self.ctr['bc_updates']
             if u > self.last_eval and (u % FLAGS.eval_interval == 0 or u == n):
                 self.run_eval(u, u, ['n1'], with_probe=False)
-            if u >= n:
+            if u >= n or (self.bc_select is not None and self.bc_select['stopped']):
                 break
             self.safe_point()
             batch = self.demo_ds.sample_sequence(self.batch_size, sequence_length=self.H, discount=FLAGS.discount)
@@ -845,15 +911,88 @@ class Trainer:
             if u % FLAGS.log_interval == 0 or u == n:
                 self.metrics.log('bc', u, jax.device_get(info))
                 self.progress(f'bc updates={u}')
-        # final_actor.pkl, written atomically; kept permanently.
-        blob = dict(actor_params=actor_params(self.agent), agent_name=self.agent.config['agent_name'],
-                    env_name=FLAGS.env_name, horizon_length=self.H, bc_steps=n, seed=FLAGS.seed)
-        path = os.path.join(self.run_dir, 'final_actor.pkl')
-        with open(path + '.tmp', 'wb') as f:
-            pickle.dump(blob, f)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(path + '.tmp', path)
+        if self.bc_select is not None:
+            self.write_selection()
+        # final_actor.pkl (the actor at the last update), written atomically; kept permanently.
+        write_atomic(os.path.join(self.run_dir, 'final_actor.pkl'), pickle.dumps(self.actor_blob()))
+
+    def actor_blob(self, **extra):
+        return dict(actor_params=actor_params(self.agent), agent_name=self.agent.config['agent_name'],
+                    env_name=FLAGS.env_name, horizon_length=self.H, bc_steps=FLAGS.bc_steps, seed=FLAGS.seed,
+                    **extra)
+
+    def bc_select_update(self, u, n1):
+        """After the n1 evaluation at update u (before its checkpoint): record it; a strictly better rate
+        than the best so far (ties keep the earlier one) makes this actor the best candidate; a rate above
+        the threshold stops BC here."""
+        sel = self.bc_select
+        rate, successes, episodes = n1['success_rate'], n1['successes'], n1['episodes']
+        rates = os.environ.get('V1_TEST_BC_EVAL_RATES')  # test hook: rates seen here (the eval row is real)
+        if rates and len(sel['evals']) < len(rates.split(',')):
+            rate = float(rates.split(',')[len(sel['evals'])])
+            successes = int(round(rate * episodes))
+        sel['evals'].append([u, successes, episodes, rate])
+        if sel['best'] is None or rate > sel['best']['rate']:
+            data = pickle.dumps(self.actor_blob(bc_updates=u, n1_successes=successes, n1_episodes=episodes,
+                                                n1_success_rate=rate))
+            write_atomic(os.path.join(self.run_dir, 'best_actor.pkl'), data)
+            import hashlib
+            sel['best'] = dict(update=u, successes=successes, episodes=episodes, rate=rate,
+                               sha256=hashlib.sha256(data).hexdigest())
+            sel['best_blob'] = data
+            print(f'BEST_ACTOR_WRITTEN update={u} successes={successes}/{episodes} rate={rate}', flush=True)
+            time.sleep(float(os.environ.get('V1_TEST_BEST_ACTOR_DELAY', 0)))  # test hook: widen until the ckpt
+        if rate > sel['threshold']:
+            sel['stopped'] = True
+            print(f'BC_SELECT_STOP update={u} rate={rate} > threshold={sel["threshold"]}', flush=True)
+
+    def write_selection(self):
+        """selected_actor.pkl (best candidate's blob + selection fields), selection.json, a bc_selection row.
+        Everything is derived from the checkpointed selection state (a resume rewrites the same bytes)."""
+        sel = self.bc_select
+        best = sel['best']
+        assert best is not None, 'actor selection: no n1 evaluation was run (bc_steps=0?)'
+        path = os.path.join(self.run_dir, 'best_actor.pkl')
+        assert file_sha256(path) == best['sha256'], f'{path} differs from the checkpointed best candidate'
+        rule = 'first_above_threshold' if sel['stopped'] else 'best_within_budget'
+        fields = dict(selection_rule=rule, threshold=sel['threshold'], selected_update=best['update'])
+        blob = pickle.loads(sel['best_blob'])
+        blob.update(fields)
+        write_atomic(os.path.join(self.run_dir, 'selected_actor.pkl'), pickle.dumps(blob))
+        info = dict(**fields, n1_successes=best['successes'], n1_episodes=best['episodes'],
+                    n1_success_rate=best['rate'], best_actor_sha256=best['sha256'],
+                    bc_updates=self.ctr['bc_updates'], bc_steps=FLAGS.bc_steps, eval_interval=FLAGS.eval_interval)
+        evals = [dict(update=u, successes=s, episodes=e, success_rate=r) for u, s, e, r in sel['evals']]
+        write_atomic(os.path.join(self.run_dir, 'selection.json'),
+                     (json.dumps(dict(info, evaluations=evals), indent=1) + '\n').encode())
+        self.metrics.log('bc_selection', self.ctr['bc_updates'], dict(info, n_evaluations=len(evals)))
+        print('BC_SELECTION ' + json.dumps(info), flush=True)
+
+    def eval_actor(self):
+        """--mode=eval_actor: one n1 evaluation of --init_actor, as phase_bc evaluates; eval_actor.json."""
+        import socket
+        res = self.evaluate(['n1'])
+        if res is None:  # preemption notice: nothing written
+            self.close_envs()
+            sys.exit(EXIT_PREEMPTED)
+        r = res['n1']
+        out = dict(successes=r['successes'], episodes=r['episodes'], success_rate=r['success_rate'],
+                   per_episode_success=None,  # evaluate_parallel returns only the means
+                   node=socket.gethostname(), init_actor=self.init_actor_info, env_name=FLAGS.env_name,
+                   eval_seed=FLAGS.eval_seed, n_eval_envs=FLAGS.n_eval_envs, eval_episodes=FLAGS.eval_episodes,
+                   **{k: v for k, v in r.items() if k.startswith('episode.')})
+        write_atomic(os.path.join(self.run_dir, 'eval_actor.json'), (json.dumps(out, indent=1) + '\n').encode())
+        print('EVAL_ACTOR ' + json.dumps({k: v for k, v in out.items() if k != 'init_actor'}), flush=True)
+        if FLAGS['project_name'].present:
+            import wandb
+            import secrets
+            self.wandb_id = secrets.token_hex(6)  # its own W&B run (not the bc run's wandb_id)
+            self.setup_wandb()
+            wandb.config.update(dict(v1=dict(mode='eval_actor', init_actor=self.init_actor_info)),
+                                allow_val_change=True)
+            wandb.log({f'eval_actor/{k}': v for k, v in out.items()
+                       if isinstance(v, (int, float)) and not isinstance(v, bool)})
+        self.close()
 
     def phase_warmup(self):
         while True:
@@ -926,6 +1065,17 @@ class Trainer:
 
 def main(_):
     assert FLAGS.run_dir, '--run_dir is required'
+    if FLAGS.mode == 'eval_actor':
+        assert FLAGS.init_actor, '--init_actor is required for --mode=eval_actor'
+        trainer = Trainer()
+        try:
+            trainer.setup()
+            trainer.eval_actor()
+        except SystemExit:
+            raise
+        except BaseException:
+            exit_on_exception(trainer)
+        return
     store = CheckpointStore(os.path.join(FLAGS.run_dir, 'ckpt'))
     man = store.manifest()
     if man is not None and man['meta'].get('phase') == 'done':
