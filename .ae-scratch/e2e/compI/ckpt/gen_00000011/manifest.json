@@ -1,0 +1,89 @@
+{
+ "gen": 11,
+ "time": 1792652589.2605147,
+ "meta": {
+  "phase": "joint",
+  "ctr": {
+   "env_steps": 1514,
+   "warmup_env_steps": 1114,
+   "episodes": 5,
+   "warmup_episodes": 4,
+   "warmup_successes": 3,
+   "warmup_failures": 1,
+   "joint_successes": 0,
+   "joint_failures": 1,
+   "pretrain_updates": 400,
+   "joint_env_steps": 400,
+   "joint_updates": 400,
+   "joint_episodes": 1
+  }
+ },
+ "files": {
+  "state.pkl": {
+   "size": 46414813,
+   "sha256": "0ad04bdc3a477a6b10679ba7a43c4167cdfaddea5d7ccc3b9ec46f75e8ea335c"
+  }
+ },
+ "segments": {
+  "main": [
+   {
+    "file": "main_000000000000_000000000130_g00000001.npz",
+    "k_from": 0,
+    "k_to": 130,
+    "size": 32236,
+    "crc": 1700336536
+   },
+   {
+    "file": "main_000000000130_000000000442_g00000002.npz",
+    "k_from": 130,
+    "k_to": 442,
+    "size": 74460,
+    "crc": 2432081546
+   },
+   {
+    "file": "main_000000000442_000000000714_g00000003.npz",
+    "k_from": 442,
+    "k_to": 714,
+    "size": 65180,
+    "crc": 226286628
+   },
+   {
+    "file": "main_000000000714_000000001114_g00000004.npz",
+    "k_from": 714,
+    "k_to": 1114,
+    "size": 94876,
+    "crc": 1517286876
+   },
+   {
+    "file": "main_000000001114_000000001514_g00000011.npz",
+    "k_from": 1114,
+    "k_to": 1514,
+    "size": 94876,
+    "crc": 1404492083
+   }
+  ],
+  "success": [
+   {
+    "file": "success_000000000000_000000000130_g00000001.npz",
+    "k_from": 0,
+    "k_to": 130,
+    "size": 32236,
+    "crc": 1700336536
+   },
+   {
+    "file": "success_000000000130_000000000442_g00000002.npz",
+    "k_from": 130,
+    "k_to": 442,
+    "size": 74460,
+    "crc": 2432081546
+   },
+   {
+    "file": "success_000000000442_000000000714_g00000003.npz",
+    "k_from": 442,
+    "k_to": 714,
+    "size": 65180,
+    "crc": 226286628
+   }
+  ]
+ }
+}

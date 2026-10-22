@@ -1,0 +1,131 @@
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=online --warmup_steps=1000 --pretrain_updates=400 --online_steps=4000 --eval_interval=1500 --buffer_cap=90000 --method=bsc --init_actor=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcA/final_actor.pkl --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bscB env=None interrupt=None
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:57:35.387134 23445246594560 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:57:35.390697 23445246594560 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:57:35.391100 23445246594560 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:57:35.497648 23445246594560 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:57:36.531777 23445246594560 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:57:36.532078 23445246594560 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME none (fresh run)
+CONFIG method=bsc agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN warmup ctr={}
+PROGRESS warmup env_steps=250 t=39.7
+CKPT_BEGIN phase=warmup reason=periodic
+CKPT_DONE gen=1 reason=periodic state_mb=39.8 segment_mb=0.1 seconds=0.25
+PROGRESS warmup env_steps=500 t=50.5
+PROGRESS warmup env_steps=750 t=58.3
+CKPT_BEGIN phase=warmup reason=periodic
+CKPT_DONE gen=2 reason=periodic state_mb=39.8 segment_mb=0.1 seconds=0.40
+PROGRESS warmup env_steps=1000 t=67.5
+PHASE_END warmup
+CKPT_BEGIN phase=pretrain reason=phase_end
+CKPT_DONE gen=3 reason=phase_end state_mb=39.8 segment_mb=0.1 seconds=0.35
+PHASE_DONE warmup
+PHASE_BEGIN pretrain ctr={'env_steps': 1200, 'warmup_env_steps': 1200, 'warmup_successes': 0, 'warmup_failures': 3, 'joint_successes': 0, 'joint_failures': 0, 'episodes': 3, 'warmup_episodes': 3}
+CKPT_BEGIN phase=pretrain reason=periodic
+CKPT_DONE gen=4 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.33
+PROGRESS pretrain updates=250 t=185.0
+PROGRESS pretrain updates=400 t=186.0
+PHASE_END pretrain
+CKPT_BEGIN phase=pretrain_eval reason=phase_end
+CKPT_DONE gen=5 reason=phase_end state_mb=46.4 segment_mb=0.0 seconds=0.28
+PHASE_DONE pretrain
+PHASE_BEGIN pretrain_eval ctr={'env_steps': 1200, 'warmup_env_steps': 1200, 'warmup_successes': 0, 'warmup_failures': 3, 'joint_successes': 0, 'joint_failures': 0, 'episodes': 3, 'warmup_episodes': 3, 'pretrain_updates': 400}
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:24<00:24, 24.17s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:24<00:00, 12.09s/it]
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:35<00:35, 35.73s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:35<00:00, 17.86s/it]
+EVAL {"n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2, "bon/success_rate": 0.0, "bon/successes": 0, "bon/episodes": 2, "probe/tie_rate": 0.0, "probe/progress_spearman": 0.10542950546868764, "probe/q_data_mean": 0.6229938268661499, "probe/cand_range_mean": 0.10021357238292694, "probe/data_gt_random": 0.765625}
+PHASE_END pretrain_eval
+CKPT_BEGIN phase=joint reason=phase_end
+CKPT_DONE gen=6 reason=phase_end state_mb=46.4 segment_mb=0.0 seconds=0.40
+PHASE_DONE pretrain_eval
+PHASE_BEGIN joint ctr={'env_steps': 1200, 'warmup_env_steps': 1200, 'warmup_successes': 0, 'warmup_failures': 3, 'joint_successes': 0, 'joint_failures': 0, 'episodes': 3, 'warmup_episodes': 3, 'pretrain_updates': 400}
+PROGRESS joint env_steps=1250 t=351.2
+PROGRESS joint env_steps=1500 t=356.0
+EVAL_BEGIN nominal=1500 step=1600 phase=joint
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:08<00:08,  8.84s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:08<00:00,  4.42s/it]
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:13<00:13, 13.16s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:13<00:00,  6.58s/it]
+EVAL {"nominal_step": 1500, "phase": "joint", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2, "bon/success_rate": 0.0, "bon/successes": 0, "bon/episodes": 2, "probe/tie_rate": 0.0, "probe/progress_spearman": 0.12693024350123974, "probe/q_data_mean": 0.6824623346328735, "probe/cand_range_mean": 0.09211136400699615, "probe/data_gt_random": 0.7939453125}
+CKPT_BEGIN phase=joint reason=eval
+CKPT_DONE gen=7 reason=eval state_mb=46.4 segment_mb=0.1 seconds=0.20
+PROGRESS joint env_steps=1750 t=385.3
+PROGRESS joint env_steps=2000 t=392.1
+CKPT_BEGIN phase=joint reason=periodic
+CKPT_DONE gen=8 reason=periodic state_mb=46.4 segment_mb=0.1 seconds=0.16
+PROGRESS joint env_steps=2250 t=400.1
+CKPT_BEGIN phase=joint reason=periodic
+CKPT_DONE gen=9 reason=periodic state_mb=46.4 segment_mb=0.1 seconds=0.16
+PROGRESS joint env_steps=2500 t=406.7
+PROGRESS joint env_steps=2750 t=411.4
+CKPT_BEGIN phase=joint reason=periodic
+CKPT_DONE gen=10 reason=periodic state_mb=46.4 segment_mb=0.1 seconds=0.16
+PROGRESS joint env_steps=3000 t=417.5
+EVAL_BEGIN nominal=3000 step=3200 phase=joint
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:08<00:08,  8.07s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:08<00:00,  4.04s/it]
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:07<00:07,  7.78s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:07<00:00,  3.89s/it]
+EVAL {"nominal_step": 3000, "phase": "joint", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2, "bon/success_rate": 0.0, "bon/successes": 0, "bon/episodes": 2, "probe/tie_rate": 0.0, "probe/progress_spearman": 0.20349573714590424, "probe/q_data_mean": 0.8438457250595093, "probe/cand_range_mean": 0.039264433085918427, "probe/data_gt_random": 0.8330078125}
+CKPT_BEGIN phase=joint reason=eval
+CKPT_DONE gen=11 reason=eval state_mb=46.4 segment_mb=0.1 seconds=0.16
+PROGRESS joint env_steps=3250 t=438.5
+PROGRESS joint env_steps=3500 t=444.4
+CKPT_BEGIN phase=joint reason=periodic
+CKPT_DONE gen=12 reason=periodic state_mb=46.4 segment_mb=0.1 seconds=0.15
+PROGRESS joint env_steps=3750 t=449.7
+PROGRESS joint env_steps=4000 t=456.1
+EVAL_BEGIN nominal=4000 step=4000 phase=joint
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:10<00:10, 10.71s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:10<00:00,  5.36s/it]
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:09<00:09,  9.38s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:09<00:00,  4.69s/it]
+EVAL {"nominal_step": 4000, "phase": "joint", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2, "bon/success_rate": 0.0, "bon/successes": 0, "bon/episodes": 2, "probe/tie_rate": 0.0, "probe/progress_spearman": 0.23035472401450222, "probe/q_data_mean": 0.9003975987434387, "probe/cand_range_mean": 0.026698386296629906, "probe/data_gt_random": 0.8056640625}
+CKPT_BEGIN phase=joint reason=eval
+CKPT_DONE gen=13 reason=eval state_mb=46.4 segment_mb=0.1 seconds=0.30
+PHASE_END joint
+CKPT_BEGIN phase=done reason=phase_end
+CKPT_DONE gen=14 reason=phase_end state_mb=46.4 segment_mb=0.0 seconds=0.26
+PHASE_DONE joint
+RUN_COMPLETE wall_s=476.8
+=== exit 0

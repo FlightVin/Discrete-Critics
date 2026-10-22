@@ -1,0 +1,18 @@
+{
+ "gen": 5,
+ "time": 1792651971.7002752,
+ "meta": {
+  "phase": "done",
+  "ctr": {
+   "bc_updates": 2000,
+   "env_steps": 0
+  }
+ },
+ "files": {
+  "state.pkl": {
+   "size": 46414142,
+   "sha256": "a8235a2f862f30442d2040a443fdf8c705930ad0a25ee487a28a9c83fd453a8f"
+  }
+ },
+ "segments": {}
+}

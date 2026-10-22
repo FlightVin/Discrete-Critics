@@ -1,0 +1,67 @@
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcB env=None interrupt=None
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:50:34.229268 22860250422784 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:50:34.229515 22860250422784 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:50:34.229621 22860250422784 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:50:34.343620 22860250422784 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:50:35.091963 22860250422784 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:50:35.092191 22860250422784 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME none (fresh run)
+CONFIG method=None agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN bc ctr={}
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=1 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.32
+PROGRESS bc updates=250 t=65.7
+PROGRESS bc updates=500 t=66.2
+PROGRESS bc updates=750 t=67.0
+PROGRESS bc updates=1000 t=68.3
+EVAL_BEGIN nominal=1000 step=1000 phase=bc
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:36<00:36, 36.59s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:36<00:00, 18.29s/it]
+EVAL {"nominal_step": 1000, "phase": "bc", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2}
+CKPT_BEGIN phase=bc reason=eval
+CKPT_DONE gen=2 reason=eval state_mb=46.4 segment_mb=0.0 seconds=0.39
+PROGRESS bc updates=1250 t=107.2
+PROGRESS bc updates=1500 t=108.8
+PROGRESS bc updates=1750 t=110.5
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=3 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.56
+PROGRESS bc updates=2000 t=113.2
+EVAL_BEGIN nominal=2000 step=2000 phase=bc
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:24<00:24, 24.81s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:24<00:00, 12.41s/it]
+EVAL {"nominal_step": 2000, "phase": "bc", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2}
+CKPT_BEGIN phase=bc reason=eval
+CKPT_DONE gen=4 reason=eval state_mb=46.4 segment_mb=0.0 seconds=0.35
+PHASE_END bc
+CKPT_BEGIN phase=done reason=phase_end
+CKPT_DONE gen=5 reason=phase_end state_mb=46.4 segment_mb=0.0 seconds=0.51
+PHASE_DONE bc
+RUN_COMPLETE wall_s=138.9
+=== exit 0

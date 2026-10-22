@@ -1,0 +1,259 @@
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcI env=None interrupt=('bc: during updates',)
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:50:34.230295 22653202624000 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:50:34.230602 22653202624000 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:50:34.230873 22653202624000 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:50:34.342296 22653202624000 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:50:35.091118 22653202624000 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:50:35.091656 22653202624000 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME none (fresh run)
+CONFIG method=None agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN bc ctr={}
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=1 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.29
+PROGRESS bc updates=250 t=65.4
+PROGRESS bc updates=500 t=66.7
+PREEMPT_FLAG_SEEN age_s=0.31 phase=bc
+CKPT_BEGIN phase=bc reason=preempt_flag
+CKPT_DONE gen=2 reason=preempt_flag state_mb=46.4 segment_mb=0.0 seconds=0.31
+EXIT_PREEMPTED source=flag notice_to_exit_s=0.71 phase=bc ctr={'bc_updates': 573}
+=== exit 143
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcI env=None interrupt=('bc: during an evaluation',)
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:52:12.925794 22796867796480 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:52:12.928086 22796867796480 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:52:12.928574 22796867796480 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:52:13.041233 22796867796480 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:52:14.403448 22796867796480 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:52:14.403716 22796867796480 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME gen=2 phase=bc ctr={'bc_updates': 573}
+CONFIG method=None agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN bc ctr={'bc_updates': 573}
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=3 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.16
+PROGRESS bc updates=750 t=69.4
+PROGRESS bc updates=1000 t=69.9
+EVAL_BEGIN nominal=1000 step=1000 phase=bc
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]PREEMPT_FLAG_SEEN age_s=0.13 phase=bc
+EVAL_ABORTED (flag)
+
+Parallel Eval:   0%|          | 0/2 [00:06<?, ?it/s]
+CKPT_BEGIN phase=bc reason=preempt_flag
+CKPT_DONE gen=4 reason=preempt_flag state_mb=46.4 segment_mb=0.0 seconds=0.26
+EXIT_PREEMPTED source=flag notice_to_exit_s=5.83 phase=bc ctr={'bc_updates': 1000}
+=== exit 143
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcI env=None interrupt=('bc: SIGKILL during updates',)
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:53:47.555457 23254904131072 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:53:47.557033 23254904131072 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:53:47.557389 23254904131072 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:53:47.647417 23254904131072 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:53:48.499808 23254904131072 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:53:48.500133 23254904131072 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME gen=4 phase=bc ctr={'bc_updates': 1000}
+CONFIG method=None agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN bc ctr={'bc_updates': 1000}
+EVAL_BEGIN nominal=1000 step=1000 phase=bc
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:29<00:29, 29.19s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:29<00:00, 14.59s/it]
+EVAL {"nominal_step": 1000, "phase": "bc", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2}
+CKPT_BEGIN phase=bc reason=eval
+CKPT_DONE gen=5 reason=eval state_mb=46.4 segment_mb=0.0 seconds=0.42
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=6 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.39
+PROGRESS bc updates=1250 t=95.5
+Process Worker<AsyncVectorEnv>-1:
+Traceback (most recent call last):
+  File "/data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/gymnasium/vector/async_vector_env.py", line 738, in _async_worker
+    command, data = pipe.recv()
+                    ^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 399, in _recv
+    raise EOFError
+EOFError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/lib64/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib64/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/gymnasium/vector/async_vector_env.py", line 848, in _async_worker
+    pipe.send((None, False))
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 206, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 427, in _send_bytes
+    self._send(header + buf)
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 384, in _send
+    n = write(self._handle, buf)
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+Process Worker<AsyncVectorEnv>-0:
+Traceback (most recent call last):
+  File "/data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/gymnasium/vector/async_vector_env.py", line 738, in _async_worker
+    command, data = pipe.recv()
+                    ^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 399, in _recv
+    raise EOFError
+EOFError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/usr/lib64/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib64/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/gymnasium/vector/async_vector_env.py", line 848, in _async_worker
+    pipe.send((None, False))
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 206, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 427, in _send_bytes
+    self._send(header + buf)
+  File "/usr/lib64/python3.12/multiprocessing/connection.py", line 384, in _send
+    n = write(self._handle, buf)
+        ^^^^^^^^^^^^^^^^^^^^^^^^
+BrokenPipeError: [Errno 32] Broken pipe
+=== exit -9
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcI env=None interrupt=None
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+[robosuite WARNING] No private macro file found! (macros.py:53)
+W1022 02:55:47.100835 22983300075008 macros.py:53] No private macro file found!
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+W1022 02:55:47.101090 22983300075008 macros.py:54] It is recommended to use a private macro file
+[robosuite WARNING] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+W1022 02:55:47.101200 22983300075008 macros.py:55] To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robosuite/scripts/setup_macros.py
+I1022 02:55:47.219334 22983300075008 acceleratesupport.py:24] No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+W1022 02:55:48.630035 22983300075008 __init__.py:30] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install.
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+W1022 02:55:48.630415 22983300075008 __init__.py:40] Could not load the mink-based whole-body IK. Make sure you install related import properly, otherwise you will not be able to use the default IK controller setting for GR1 robot.
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+the size of the dataset is 80731
+Created environment with name NutAssemblySquare
+Action size is 7
+/usr/lib64/python3.12/multiprocessing/popen_fork.py:66: RuntimeWarning: os.fork() was called. os.fork() is incompatible with multithreaded code, and JAX is multithreaded, so this will likely lead to a deadlock.
+  self.pid = os.fork()
+Created environment with name NutAssemblySquare
+Action size is 7
+Created environment with name NutAssemblySquare
+Action size is 7
+RESUME gen=6 phase=bc ctr={'bc_updates': 1001}
+CONFIG method=None agent=acbsc actor_type=best-of-n actor_num_samples=32
+PHASE_BEGIN bc ctr={'bc_updates': 1001}
+CKPT_BEGIN phase=bc reason=periodic
+CKPT_DONE gen=7 reason=periodic state_mb=46.4 segment_mb=0.0 seconds=0.28
+PROGRESS bc updates=1250 t=41.0
+PROGRESS bc updates=1500 t=41.7
+PROGRESS bc updates=1750 t=42.4
+PROGRESS bc updates=2000 t=43.3
+EVAL_BEGIN nominal=2000 step=2000 phase=bc
+
+Parallel Eval:   0%|          | 0/2 [00:00<?, ?it/s]
+Parallel Eval:  50%|█████     | 1/2 [00:24<00:24, 24.99s/it]
+Parallel Eval: 100%|██████████| 2/2 [00:24<00:00, 12.49s/it]
+EVAL {"nominal_step": 2000, "phase": "bc", "n1/success_rate": 0.0, "n1/successes": 0, "n1/episodes": 2}
+CKPT_BEGIN phase=bc reason=eval
+CKPT_DONE gen=8 reason=eval state_mb=46.4 segment_mb=0.0 seconds=0.24
+PHASE_END bc
+CKPT_BEGIN phase=done reason=phase_end
+CKPT_DONE gen=9 reason=phase_end state_mb=46.4 segment_mb=0.0 seconds=0.28
+PHASE_DONE bc
+RUN_COMPLETE wall_s=68.8
+=== exit 0
+=== launch --env_name=square-mh-low_dim --horizon_length=5 --n_eval_envs=2 --eval_episodes=1 --log_interval=250 --ckpt_minutes=0.1 --seed=0 --mode=bc --agent=agents/acbsc.py --agent.actor_type=best-of-n --bc_steps=2000 --eval_interval=1000 --run_dir=/home/vineethb/ae/work/v1rec/.ae-scratch/e2e/bcI env=None interrupt=None
+ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+RUN_ALREADY_COMPLETE gen=9 ctr={'bc_updates': 2000, 'env_steps': 0}
+=== exit 0
