@@ -447,6 +447,7 @@ class Trainer:
         self.run_dir = FLAGS.run_dir
         os.makedirs(self.run_dir, exist_ok=True)
         self.mode = FLAGS.mode
+        self.bc_select = None  # actor selection state (bc with --bc_select_threshold >= 0; set in setup)
         self.store = None
         if self.mode != 'eval_actor':  # eval_actor: no checkpoints
             self.store = CheckpointStore(os.path.join(self.run_dir, 'ckpt'))
