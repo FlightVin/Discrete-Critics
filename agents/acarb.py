@@ -15,9 +15,14 @@ from utils.networks import ActorVectorField, ARCritic, ensemblize
 def ar_bin(y, base, length):
     """Base-B expansion of y in [0, 1) into `length` digits, rounding down (Eq. 2.2).
 
-    Uses the integer code floor(y B^L) to avoid float drift from repeated residuals.
+    Uses the integer code floor(y B^L) to avoid float drift from repeated residuals. A plain float32
+    floor drops exact codes by one (ar_decode([0, 1, 6]) = 0.01599999 -> 15), so values within
+    1e-3 code units of an integer snap to it; everything else keeps floor (0.5835 -> 583).
     """
-    n = jnp.clip(jnp.floor(y * base ** length), 0, base ** length - 1).astype(jnp.int32)
+    s = y * base ** length
+    r = jnp.round(s)
+    s = jnp.where(jnp.abs(s - r) < 1e-3, r, jnp.floor(s))
+    n = jnp.clip(s, 0, base ** length - 1).astype(jnp.int32)
     powers = base ** jnp.arange(length - 1, -1, -1, dtype=jnp.int32)
     return (n[..., None] // powers) % base
 
@@ -44,6 +49,19 @@ def ar_expected(critic_fn, observations, actions, base, length):
     last = (jnp.exp(logp[..., -1, :]) * jnp.arange(base)).sum(-1)
     values = ar_decode(prefixes, base) + last * base ** -length  # (num_qs, ..., K)
     return (jnp.exp(log_prefix) * values).sum(-1)
+
+
+# ARB-QC (arb_value='qc') maps raw QC values q in [-100, 0] to u = (q + 100) / 100 in [0, 1). With base 10
+# and 3 digits, u has resolution 1e-3, i.e. 0.1 Q-units; q = 0 (u = 1) clips to the top code 0.999.
+QC_SCALE = 100.0
+
+
+def u_to_raw(u):
+    return QC_SCALE * u - QC_SCALE
+
+
+def raw_to_u(q):
+    return (q + QC_SCALE) / QC_SCALE
 
 
 def _wmean(x, w):
@@ -77,16 +95,9 @@ class ACARBAgent(flax.struct.PyTreeNode):
             return ar_expected(critic_fn, observations, actions, B, L)
         raise ValueError(f'unknown arb_readout {readout}')
 
-    def critic_loss(self, batch, grad_params, rng):
-        """Compute the ACARB critic loss."""
+    def td_target(self, batch, sample_rng, readout_rng):
+        """TD target as (y, u, info): y in value units (P(success) or raw QC), u = clipped digit fraction."""
         B, L = self.config['arb_base'], self.config['arb_length']
-
-        if self.config["action_chunking"]:
-            batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
-        else:
-            batch_actions = batch["actions"][..., 0, :]
-
-        rng, sample_rng, readout_rng, diag_rng = jax.random.split(rng, 4)
         next_obs = batch['next_observations'][..., -1, :]
         if self.config['critic_target_bon']:
             next_actions = self.sample_actions(next_obs, rng=sample_rng)
@@ -98,26 +109,50 @@ class ACARBAgent(flax.struct.PyTreeNode):
             next_actions = self.compute_flow_actions(next_obs, noises)
             next_actions = jnp.clip(next_actions, -1, 1)
 
-        next_qs = self.critic_value(next_obs, next_actions, target=True, rng=readout_rng)
-        if self.config['q_agg'] == 'min':
-            next_q = next_qs.min(axis=0)
-        else:
-            next_q = next_qs.mean(axis=0)
+        next_qs = self.critic_value(next_obs, next_actions, target=True, rng=readout_rng)  # digit fractions
 
         # Same terminal handling as ACBSC.
         bsc_is_terminal = batch['terminals'][..., -1] > 0.5
         bsc_is_success = bsc_is_terminal & (batch['masks'][..., -1] < 0.5)
         trajectory_success = batch['num_chunks_to_success'] >= 0.0
+        info = {
+            'success_frac': bsc_is_success.astype(jnp.float32).mean(),
+            'timeout_frac': (bsc_is_terminal & ~bsc_is_success).astype(jnp.float32).mean(),
+        }
 
-        if self.config['use_mc_target']:
-            target_q = trajectory_success.astype(jnp.float32)
+        if self.config['arb_value'] == 'qc':
+            # Bellman backup in raw QC units, exactly as ACFQL: y = R + gamma^H * M * qbar(s', a').
+            next_q = self._agg(u_to_raw(next_qs))
+            target_q = batch['rewards'][..., -1] + \
+                (self.config['discount'] ** self.config['horizon_length']) * batch['masks'][..., -1] * next_q
+            u = raw_to_u(target_q)
+            info['clip_low_frac'] = (u < 0.0).astype(jnp.float32).mean()
+            info['clip_high_frac'] = (u > 1.0 - B ** -L).astype(jnp.float32).mean()
         else:
-            target_q = (
-                (bsc_is_terminal & bsc_is_success).astype(jnp.float32) * 1.0
-                + (~bsc_is_terminal).astype(jnp.float32) * self.config['discount'] * next_q
-            )
-        # y = 1 is not representable in [0, 1); clip to the largest code.
-        target_q = jnp.clip(target_q, 0.0, 1.0 - B ** -L)
+            next_q = self._agg(next_qs)
+            if self.config['use_mc_target']:
+                target_q = trajectory_success.astype(jnp.float32)
+            else:
+                target_q = (
+                    (bsc_is_terminal & bsc_is_success).astype(jnp.float32) * 1.0
+                    + (~bsc_is_terminal).astype(jnp.float32) * self.config['discount'] * next_q
+                )
+            u = target_q
+        # u = 1 is not representable in [0, 1); clip to the largest code.
+        return target_q, jnp.clip(u, 0.0, 1.0 - B ** -L), info
+
+    def critic_loss(self, batch, grad_params, rng):
+        """Compute the ACARB critic loss."""
+        B, L = self.config['arb_base'], self.config['arb_length']
+
+        if self.config["action_chunking"]:
+            batch_actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
+        else:
+            batch_actions = batch["actions"][..., 0, :]
+
+        # The 4th key used to feed the readout diagnostics; kept so the key stream is unchanged.
+        rng, sample_rng, readout_rng, _ = jax.random.split(rng, 4)
+        raw_target, target_q, target_info = self.td_target(batch, sample_rng, readout_rng)
         labels = ar_bin(target_q, B, L)  # (batch, L)
 
         # Positional args only: nn.vmap (ensemblize) silently drops kwargs.
@@ -145,23 +180,35 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'first_digit_wrong_frac': _wmean(first_wrong, wb),
             'greedy_mae_first_wrong': _wmean(abs_err, wb * first_wrong),
             'greedy_mae_first_right': _wmean(abs_err, wb * ~first_wrong),
-            'success_frac': bsc_is_success.astype(jnp.float32).mean(),
-            'timeout_frac': (bsc_is_terminal & ~bsc_is_success).astype(jnp.float32).mean(),
+            **target_info,
         }
+        if self.config['arb_value'] == 'qc':
+            # q / target_q / greedy_mae above are digit fractions; these are raw QC units.
+            info['q_raw'] = _wmean(u_to_raw(greedy_q), wb)
+            info['target_q_raw'] = raw_target.mean()
         for l in range(L):
             info[f'ce_digit{l + 1}'] = _wmean(ce[..., l], wb)
             info[f'tf_acc_digit{l + 1}'] = _wmean(tf_correct[..., l], wb)
             info[f'greedy_acc_digit{l + 1}'] = _wmean(greedy_correct[..., l], wb)
-        info.update(self._readout_diagnostics(batch['observations'], batch_actions, greedy_q, wb, diag_rng))
         return critic_loss, info
 
-    def _readout_diagnostics(self, observations, actions, greedy_q, wb, rng):
+    @jax.jit
+    def readout_diagnostics(self, batch, rng):
         """Greedy vs exact expected readout, on batch (s, a) and on best-of-n candidates.
 
-        If the digit distribution is sharp, the two agree and greedy is harmless.
+        If the digit distribution is sharp, the two agree and greedy is harmless. Costly (exact
+        expectation over B^(L-1) prefixes), so it is not part of the update; call it at log intervals.
+        Values are digit fractions; keys carry the 'critic/' prefix used by the update info.
         """
         B, L = self.config['arb_base'], self.config['arb_length']
         sg = jax.lax.stop_gradient
+        if self.config["action_chunking"]:
+            actions = jnp.reshape(batch["actions"], (batch["actions"].shape[0], -1))
+        else:
+            actions = batch["actions"][..., 0, :]
+        observations = batch['observations']
+        greedy_q = self.critic_value(observations, actions, readout='greedy')
+        wb = jnp.broadcast_to(batch['valid'][..., -1], greedy_q.shape)
         expected_q = sg(self.critic_value(observations, actions, readout='expected'))
         digit1_p = jax.nn.softmax(sg(self.network.select('critic')(
             observations, actions, jnp.zeros((*actions.shape[:-1], L), jnp.int32)))[..., 0, :], axis=-1)
@@ -173,7 +220,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
         top = cand_greedy.max(-1, keepdims=True)
         spread = lambda q: (q.max(-1) - q.min(-1)).mean()
 
-        return {
+        info = {
             'expected_q': _wmean(expected_q, wb),
             'greedy_expected_gap': _wmean(jnp.abs(greedy_q - expected_q), wb),
             'greedy_minus_expected': _wmean(greedy_q - expected_q, wb),
@@ -184,6 +231,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'bon_expected_spread': spread(cand_expected),
             'bon_greedy_expected_gap': jnp.abs(cand_greedy - cand_expected).mean(),
         }
+        return {f'critic/{k}': v for k, v in info.items()}
 
     def actor_loss(self, batch, grad_params, rng):
         """BC flow loss (best-of-n uses the critic only at sampling time)."""
@@ -376,6 +424,13 @@ class ACARBAgent(flax.struct.PyTreeNode):
             config: Configuration dictionary.
         """
         assert config['actor_type'] == 'best-of-n', 'greedy ARB readout has no action gradient'
+        if 'arb_value' not in config:  # configs saved before ARB-QC existed
+            config['arb_value'] = 'bsc'
+        assert config['arb_value'] in ('bsc', 'qc'), config['arb_value']
+        if config['arb_value'] == 'qc':
+            # Raw QC values span [-1/(1-gamma), 0] = [-QC_SCALE, 0] only for gamma = 0.99.
+            assert abs(config['discount'] - (1 - 1 / QC_SCALE)) < 1e-9, 'arb_value=qc needs discount=0.99'
+            assert not config['use_mc_target'], 'use_mc_target is a BSC-only option'
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -456,7 +511,7 @@ def get_config():
             value_hidden_dims=(512, 512, 512, 512),  # Critic trunk hidden dimensions.
             layer_norm=True,  # Whether to use layer normalization.
             actor_layer_norm=False,  # Whether to use layer normalization for the actor.
-            discount=1.0,  # Q = P(success), as in ACBSC.
+            discount=1.0,  # Q = P(success), as in ACBSC. arb_value='qc' needs 0.99.
             tau=0.005,  # Target network update rate.
             q_agg='mean',  # Aggregation method for target Q values.
             num_qs=2,  # critic ensemble size
@@ -480,6 +535,7 @@ def get_config():
             arb_readout='greedy',  # Q readout for best-of-n and TD targets: 'greedy', 'sample' (mean of samples), 'expected' (exact).
             arb_readout_samples=32,  # Codes averaged per (s, a) when arb_readout='sample'.
             arb_diag_obs=32,  # Observations used for the best-of-n readout diagnostics.
+            arb_value='bsc',  # 'bsc': digits encode P(success); 'qc': digits encode (q + 100) / 100 of the raw QC value.
         )
     )
     return config
