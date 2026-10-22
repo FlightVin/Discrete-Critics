@@ -92,6 +92,18 @@ flags.DEFINE_string('project_name', 'qc', 'W&B project.')
 flags.DEFINE_string('run_group', 'v1', 'W&B group.')
 flags.DEFINE_string('wandb_name', None, 'W&B run name.')
 
+
+def argv_with_method_agent(argv):
+    """With --method and no --agent file: use the method's agent file, so --agent.* overrides parse."""
+    method = [a.split('=', 1)[1] for a in argv if a.startswith('--method=')]
+    if method and method[-1] in V1_METHODS and not any(a == '--agent' or a.startswith('--agent=') for a in argv):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agents', f'{V1_METHODS[method[-1]][0]}.py')
+        return [argv[0], f'--agent={path}', *argv[1:]]
+    return argv
+
+
+if __name__ == '__main__':
+    sys.argv[:] = argv_with_method_agent(sys.argv)  # before DEFINE_config_file: it reads sys.argv
 config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 
 # Flags that may change between restarts of the same run.
@@ -262,15 +274,6 @@ def check_agent_config(mode, config):
     if errors:
         print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
         sys.exit(2)
-
-
-def argv_with_method_agent(argv):
-    """With --method and no --agent file: use the method's agent file, so --agent.* overrides parse."""
-    method = [a.split('=', 1)[1] for a in argv if a.startswith('--method=')]
-    if method and method[-1] in V1_METHODS and not any(a == '--agent' or a.startswith('--agent=') for a in argv):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agents', f'{V1_METHODS[method[-1]][0]}.py')
-        return [argv[0], f'--agent={path}', *argv[1:]]
-    return argv
 
 
 def actor_params(agent):
@@ -903,4 +906,4 @@ def main(_):
 
 
 if __name__ == '__main__':
-    app.run(main, argv=argv_with_method_agent(sys.argv))
+    app.run(main)
