@@ -2,16 +2,25 @@
 
   --mode=bc      actor-only BC on the demos for --bc_steps updates; n1 eval every --eval_interval and at
                  the end; writes <run_dir>/final_actor.pkl.
-  --mode=online  agent created with --seed, actor replaced by --init_actor, fresh optimiser; then phases
+  --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
+                 --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
+                 fresh optimisers; then phases
                  warmup (n1 actions, no updates) -> pretrain (critic-only updates on main replay)
                  -> pretrain_eval (n1 + best-of-n eval, critic probe) -> joint (best-of-n actions; per env
                  step one critic loss on main replay + actor BC loss on success replay, one gradient step).
 
-Preemption: on SIGTERM the run stops at the next safe point (episode boundary during env interaction,
-any update boundary otherwise), writes a checkpoint and exits with code 143. Started again with the same
-arguments it resumes from the committed checkpoint; a finished run exits 0 at once. Checkpoints are also
-written every --ckpt_minutes, after each evaluation and at each phase end. See utils/ckpt_v1.py and
-utils/replay_v1.py.
+Optimisers: actor and critic modules each have their own Adam (own moments and step count; same lr,
+betas, eps and weight decay as the agent's single optimiser), so the actor's first joint step is a first
+Adam step and critic-only / actor-only updates leave the other optimiser's state untouched.
+
+Preemption: if env AE_PREEMPT_FLAG names a file, its appearance (written by the job preamble about two
+minutes before the kill) stops the run at the next safe point (episode boundary during env interaction,
+any update boundary otherwise; a running evaluation is abandoned), which writes a checkpoint and exits
+with code 143. A background thread polls the file every second; safe points also check it. SIGTERM is
+treated the same way, best effort only (on Babel the kill follows it within a second). Started again
+with the same arguments the run resumes from the committed checkpoint; a finished run exits 0 at once.
+Checkpoints are also written every --ckpt_minutes, after each evaluation and at each phase end. See
+utils/ckpt_v1.py and utils/replay_v1.py.
 
 Notes on the schedule: warm-up ends at the first episode boundary at or after --warmup_steps (so no
 episode is cut). Joint evaluations are due at multiples of --eval_interval online steps and run at the
@@ -22,8 +31,10 @@ import json
 import os
 import pickle
 import random
+import re
 import signal
 import sys
+import threading
 import time
 from collections import defaultdict
 
@@ -31,11 +42,12 @@ import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from absl import app, flags
 from ml_collections import config_flags
 from scipy.stats import spearmanr
 
-from agents import agents
+from agents import V1_METHODS, agents, v1_config
 from envs.env_utils import make_env_and_datasets, make_vectorized_eval_envs
 from envs.robomimic_utils import get_max_episode_length, is_robomimic_env
 from evaluation import evaluate_parallel
@@ -53,6 +65,7 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online'], 'bc: shared BC preparation run; online: one method run.')
+flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online: path to final_actor.pkl from the bc run.')
 flags.DEFINE_string('env_name', 'square-mh-low_dim', 'Environment (dataset) name.')
@@ -93,16 +106,54 @@ def _modules(params, critic):
     return [k for k in params if ('critic' in k) == critic]
 
 
-def _keep(new_net, old_net, names):
+def _group(module):
+    return 'target' if 'target' in module else 'critic' if 'critic' in module else 'actor'
+
+
+def split_optimizer(agent):
+    """Rebuild the agent's TrainState with one Adam for the actor modules and one for the critic.
+
+    Same lr / betas / eps / weight decay as the agent's create(); target modules get no optimiser (they
+    are set by target_update). Optimiser state starts fresh (step counts 0)."""
+    cfg = agent.config
+
+    def adam():
+        if cfg['weight_decay'] > 0.:
+            return optax.adamw(learning_rate=cfg['lr'], weight_decay=cfg['weight_decay'])
+        return optax.adam(learning_rate=cfg['lr'])
+
+    params = agent.network.params
+    tx = optax.multi_transform({'actor': adam(), 'critic': adam(), 'target': optax.set_to_zero()},
+                               {k: _group(k) for k in params})
+    return agent.replace(network=agent.network.replace(tx=tx, opt_state=tx.init(params)))
+
+
+def opt_counts(agent):
+    """{group: Adam step count} of a split optimiser."""
+    out = {}
+    for g in ('actor', 'critic'):
+        st = agent.network.opt_state.inner_states[g]
+        counts = [int(x) for x in jax.tree_util.tree_leaves(st) if np.ndim(x) == 0]
+        out[g] = counts[0]
+    return out
+
+
+def _keep(new_net, old_net, names, group):
+    """Restore modules `names` and optimiser group `group` from old_net (that group was not updated)."""
     params = dict(new_net.params)
     for k in names:
         params[k] = old_net.params[k]
-    return new_net.replace(params=params)
+    opt = new_net.opt_state
+    if isinstance(opt, optax.MultiTransformState):
+        inner = dict(opt.inner_states)
+        inner[group] = old_net.opt_state.inner_states[group]
+        opt = opt._replace(inner_states=inner)
+    return new_net.replace(params=params, opt_state=opt)
 
 
 @jax.jit
 def bc_update(agent, batch):
-    """Actor BC loss only; critic and target critic untouched."""
+    """Actor BC loss only; critic, target critic and the critic optimiser untouched."""
     new_rng, rng = jax.random.split(agent.rng)
 
     def loss_fn(grad_params):
@@ -110,13 +161,13 @@ def bc_update(agent, batch):
         return loss, {f'actor/{k}': v for k, v in info.items()}
 
     network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-    network = _keep(network, agent.network, _modules(network.params, critic=True))
+    network = _keep(network, agent.network, _modules(network.params, critic=True), 'critic')
     return agent.replace(network=network, rng=new_rng), info
 
 
 @jax.jit
 def critic_update(agent, batch):
-    """Critic loss only, then the target update; actor params are kept bit-identical."""
+    """Critic loss only, then the target update; actor params and actor optimiser kept bit-identical."""
     new_rng, rng = jax.random.split(agent.rng)
 
     def loss_fn(grad_params):
@@ -124,25 +175,32 @@ def critic_update(agent, batch):
         return loss, {f'critic/{k}': v for k, v in info.items()}
 
     network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
-    network = _keep(network, agent.network, _modules(network.params, critic=False))
+    network = _keep(network, agent.network, _modules(network.params, critic=False), 'actor')
     agent.target_update(network, 'critic')
     return agent.replace(network=network, rng=new_rng), info
+
+
+def joint_rngs(agent):
+    """(next agent rng, actor loss rng, critic loss rng) of joint_update."""
+    new_rng, rng = jax.random.split(agent.rng)
+    rng, actor_rng, critic_rng = jax.random.split(rng, 3)
+    return new_rng, actor_rng, critic_rng
+
+
+def joint_loss(agent, main_batch, success_batch, grad_params, actor_rng, critic_rng):
+    critic_loss, critic_info = agent.critic_loss(main_batch, grad_params, critic_rng)
+    actor_loss, actor_info = agent.actor_loss(success_batch, grad_params, actor_rng)
+    info = {f'critic/{k}': v for k, v in critic_info.items()}
+    info.update({f'actor/{k}': v for k, v in actor_info.items()})
+    return critic_loss + actor_loss, info
 
 
 @jax.jit
 def joint_update(agent, main_batch, success_batch):
     """Critic loss on main replay + actor BC loss on success replay, one gradient step, then target update."""
-    new_rng, rng = jax.random.split(agent.rng)
-    rng, actor_rng, critic_rng = jax.random.split(rng, 3)
-
-    def loss_fn(grad_params):
-        critic_loss, critic_info = agent.critic_loss(main_batch, grad_params, critic_rng)
-        actor_loss, actor_info = agent.actor_loss(success_batch, grad_params, actor_rng)
-        info = {f'critic/{k}': v for k, v in critic_info.items()}
-        info.update({f'actor/{k}': v for k, v in actor_info.items()})
-        return critic_loss + actor_loss, info
-
-    network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
+    new_rng, actor_rng, critic_rng = joint_rngs(agent)
+    network, info = agent.network.apply_loss_fn(
+        loss_fn=lambda p: joint_loss(agent, main_batch, success_batch, p, actor_rng, critic_rng))
     agent.target_update(network, 'critic')
     return agent.replace(network=network, rng=new_rng), info
 
@@ -163,6 +221,56 @@ def bon_actions(agent, observations, rng):
 def _seed_numpy(seed):
     """Runs inside an eval env worker (via AsyncVectorEnv.call): robomimic resets draw from numpy's RNG."""
     np.random.seed(seed)
+
+
+def _agent_override_keys(argv):
+    """Keys given on the command line as --agent.<key>=... or --agent.<key> <value>."""
+    keys = []
+    for a in argv:
+        m = re.match(r'^--agent\.([A-Za-z0-9_.]+)(=|$)', a)
+        if m:
+            keys.append(m.group(1))
+    return keys
+
+
+def resolve_agent_config(method, flag_config, argv):
+    """v1_config(method) with the command line's --agent.* overrides applied on top.
+
+    flag_config is FLAGS.agent (the --agent file's get_config() with the overrides already applied; with
+    --method the --agent file defaults to the method's agent, see argv_with_method_agent)."""
+    if method is None:
+        return flag_config
+    config = v1_config(method)
+    assert flag_config['agent_name'] == config['agent_name'], \
+        f'--agent is {flag_config["agent_name"]} but --method={method} uses {config["agent_name"]}'
+    with config.unlocked():
+        for k in _agent_override_keys(argv):
+            config[k] = flag_config[k]
+    return config
+
+
+def check_agent_config(mode, config):
+    """Refuse configurations outside the v1 protocol (exit code 2)."""
+    errors = []
+    if config['actor_type'] != 'best-of-n':  # bc too: best-of-n has the pure BC actor loss
+        errors.append(f"actor_type={config['actor_type']} (need best-of-n)")
+    if mode == 'online':
+        if FLAGS.method is None:
+            errors.append('--method is required for --mode=online')
+        if config['actor_num_samples'] != 32:
+            errors.append(f"actor_num_samples={config['actor_num_samples']} (need 32)")
+    if errors:
+        print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
+        sys.exit(2)
+
+
+def argv_with_method_agent(argv):
+    """With --method and no --agent file: use the method's agent file, so --agent.* overrides parse."""
+    method = [a.split('=', 1)[1] for a in argv if a.startswith('--method=')]
+    if method and method[-1] in V1_METHODS and not any(a == '--agent' or a.startswith('--agent=') for a in argv):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agents', f'{V1_METHODS[method[-1]][0]}.py')
+        return [argv[0], f'--agent={path}', *argv[1:]]
+    return argv
 
 
 def actor_params(agent):
@@ -233,14 +341,50 @@ class EvalAborted(Exception):
     pass
 
 
+class PreemptWatcher:
+    """Polls the file named by AE_PREEMPT_FLAG; calls on_flag(mtime) once when it exists."""
+
+    def __init__(self, path, on_flag, poll_s=1.0):
+        self.path, self.on_flag, self.poll_s = path, on_flag, poll_s
+        self.fired = False
+        self.lock = threading.Lock()
+        self.t_last = 0.0
+        threading.Thread(target=self._loop, daemon=True, name='preempt-watch').start()
+
+    def check(self, min_interval=0.0):
+        """True once the file has been seen. Cheap; also called from safe points (rate-limited)."""
+        if self.fired:
+            return True
+        now = time.time()
+        if now - self.t_last < min_interval:
+            return False
+        self.t_last = now
+        try:
+            mtime = os.stat(self.path).st_mtime
+        except FileNotFoundError:
+            return False
+        with self.lock:
+            if not self.fired:
+                self.fired = True
+                self.on_flag(mtime)
+        return True
+
+    def _loop(self):
+        while not self.check():
+            time.sleep(self.poll_s)
+
+
 class Trainer:
     def __init__(self):
         self.t_start = time.time()
         self.stop_requested = False
-        self.t_sigterm = None
+        self.t_stop_ref = None      # flag file mtime (or SIGTERM receipt time): exit deadline reference
+        self.stop_source = None
         self.pid = os.getpid()
         self.done_msg = None
         signal.signal(signal.SIGTERM, self._on_sigterm)
+        flag = os.environ.get('AE_PREEMPT_FLAG')
+        self.watcher = PreemptWatcher(flag, self._on_flag) if flag else None
 
         self.run_dir = FLAGS.run_dir
         os.makedirs(self.run_dir, exist_ok=True)
@@ -255,9 +399,19 @@ class Trainer:
         if os.getpid() != self.pid:
             return
         if not self.stop_requested:
-            self.t_sigterm = time.time()
-            print(f'SIGTERM_RECEIVED t={self.t_sigterm:.3f}', flush=True)
+            self.t_stop_ref, self.stop_source = time.time(), 'sigterm'
+            print(f'SIGTERM_RECEIVED t={self.t_stop_ref:.3f} (best effort)', flush=True)
         self.stop_requested = True
+
+    def _on_flag(self, mtime):
+        """Preemption notice (watcher thread or a safe point)."""
+        if not self.stop_requested:
+            self.t_stop_ref, self.stop_source = mtime, 'flag'
+            print(f'PREEMPT_FLAG_SEEN age_s={time.time() - mtime:.2f} phase={self.phase_name()}', flush=True)
+        self.stop_requested = True
+
+    def phase_name(self):
+        return getattr(self, 'phase', None)
 
     # ---- setup ----------------------------------------------------------------------------------
     def check_args(self):
@@ -279,9 +433,10 @@ class Trainer:
 
     def setup(self):
         self.check_args()
-        config = FLAGS.agent
+        config = resolve_agent_config(FLAGS.method, FLAGS.agent, sys.argv)
         config['horizon_length'] = FLAGS.horizon_length
-        assert config['actor_type'] == 'best-of-n', 'v1 uses best-of-n actions and a pure BC actor loss'
+        check_agent_config(self.mode, config)
+        self.config = config
         self.H = FLAGS.horizon_length
         self.batch_size = config['batch_size']
 
@@ -295,19 +450,23 @@ class Trainer:
 
         agent = agents[config['agent_name']].create(
             FLAGS.seed, self.demos['observations'][0], self.demos['actions'][0], config)
+        self.init_actor_info = None
         if self.mode == 'online':
             with open(FLAGS.init_actor, 'rb') as f:
                 blob = pickle.load(f)
-            assert blob['agent_name'] == config['agent_name'] and blob['horizon_length'] == self.H, blob.keys()
+            # The actor modules are the same in every agent; the BC run may have used any of them.
+            assert blob['horizon_length'] == self.H, (blob['horizon_length'], self.H)
             params = dict(agent.network.params)
             assert set(blob['actor_params']) == set(_modules(params, critic=False)), \
                 (sorted(blob['actor_params']), sorted(params))
             for k, v in blob['actor_params'].items():
-                assert jax.tree_util.tree_structure(v) == jax.tree_util.tree_structure(params[k]), k
+                shapes = lambda t: jax.tree_util.tree_map(np.shape, t)  # noqa: E731
+                assert shapes(v) == shapes(params[k]), k
                 params[k] = jax.tree_util.tree_map(jnp.asarray, v)
-            network = agent.network.replace(params=params, opt_state=agent.network.tx.init(params))
-            agent = agent.replace(network=network)
-        self.agent = agent
+            agent = agent.replace(network=agent.network.replace(params=params))
+            self.init_actor_info = dict(path=FLAGS.init_actor, agent_name=blob['agent_name'],
+                                        **{k: blob[k] for k in ('bc_steps', 'seed', 'source') if k in blob})
+        self.agent = split_optimizer(agent)  # fresh: both step counts 0
 
         # Eval envs before seeding/restoring: AsyncVectorEnv builds a dummy env in this process, and
         # robomimic's make_env reseeds numpy's global RNG. Keep the global state untouched regardless.
@@ -346,6 +505,14 @@ class Trainer:
 
         self.metrics = MetricsLog(os.path.join(self.run_dir, 'metrics.jsonl'), self.metrics_offset)
         self.setup_wandb()
+        run_config = dict(method=FLAGS.method, agent_name=config['agent_name'], agent=config.to_dict(),
+                          init_actor=self.init_actor_info)
+        import wandb
+        wandb.config.update(dict(v1=run_config), allow_val_change=True)
+        if self.metrics_offset == 0:  # first row of the run's log (rewritten if no checkpoint follows it)
+            self.metrics.log('config', 0, run_config, wandb_too=False)
+        print(f'CONFIG method={FLAGS.method} agent={config["agent_name"]} '
+              f'actor_type={config["actor_type"]} actor_num_samples={config["actor_num_samples"]}', flush=True)
         self.t_last_ckpt = time.time()
         self.ob, self.action_queue, self.ep_rows = None, [], []
 
@@ -370,7 +537,7 @@ class Trainer:
     # ---- checkpoint -----------------------------------------------------------------------------
     def state_dict(self):
         state = dict(
-            version=1, mode=self.mode, phase=self.phase, ctr=dict(self.ctr), last_eval=self.last_eval,
+            version=2, mode=self.mode, phase=self.phase, ctr=dict(self.ctr), last_eval=self.last_eval,
             env_acc={k: list(v) for k, v in self.env_acc.items()},
             agent=jax.device_get(flax.serialization.to_state_dict(self.agent)),
             action_key=np.asarray(jax.device_get(self.action_key)),
@@ -405,7 +572,7 @@ class Trainer:
         if state is None:
             print('RESUME none (fresh run)', flush=True)
             return
-        assert state['mode'] == self.mode
+        assert state['mode'] == self.mode and state.get('version') == 2, (state['mode'], state.get('version'))
         self.agent = flax.serialization.from_state_dict(self.agent, state['agent'])
         self.action_key = jnp.asarray(state['action_key'])
         np.random.set_state(state['np_rng'])
@@ -424,9 +591,11 @@ class Trainer:
 
     def safe_point(self, force=None):
         """Called only where the state is fully defined by state_dict() + replay."""
+        if self.watcher is not None:
+            self.watcher.check(min_interval=0.5)  # the thread polls too; this bounds the latency at safe points
         due = (time.time() - self.t_last_ckpt) > FLAGS.ckpt_minutes * 60
         if self.stop_requested or force or due:
-            self.checkpoint(force or ('sigterm' if self.stop_requested else 'periodic'))
+            self.checkpoint(force or (f'preempt_{self.stop_source}' if self.stop_requested else 'periodic'))
             if self.done_msg:  # the phase is committed as complete only now
                 print(self.done_msg, flush=True)
                 self.done_msg = None
@@ -434,16 +603,31 @@ class Trainer:
             self.exit_preempted()
 
     def exit_preempted(self):
-        dt = time.time() - self.t_sigterm
-        print(f'EXIT_PREEMPTED sigterm_to_exit_s={dt:.2f} phase={self.phase} ctr={dict(self.ctr)}', flush=True)
+        self.close_envs()
+        dt = time.time() - self.t_stop_ref
+        print(f'EXIT_PREEMPTED source={self.stop_source} notice_to_exit_s={dt:.2f} phase={self.phase} '
+              f'ctr={dict(self.ctr)}', flush=True)
+        # Not in metrics.jsonl: rows after the last checkpoint are dropped on resume.
+        rec = dict(time=time.time(), source=self.stop_source, notice_to_exit_s=round(dt, 3), phase=self.phase,
+                   ctr=dict(self.ctr), gen=self.store.gen)
+        with open(os.path.join(self.run_dir, 'preemptions.jsonl'), 'a') as f:
+            f.write(json.dumps(rec) + '\n')
+        try:
+            import wandb
+            wandb.log({'preempt/notice_to_exit_s': dt, 'global_step': int(self.ctr['env_steps'] or self.ctr['bc_updates'])})
+        except Exception:
+            pass
         self.close()
         sys.exit(EXIT_PREEMPTED)
 
-    def close(self):
+    def close_envs(self):
         try:
             self.eval_envs.close()
         except Exception:
             pass
+
+    def close(self):
+        self.close_envs()
         try:
             import wandb
             wandb.finish()
@@ -452,7 +636,7 @@ class Trainer:
 
     # ---- evaluation and probe -------------------------------------------------------------------
     def evaluate(self, rules):
-        """{rule: stats} or None if a SIGTERM arrived (eval aborted; no state was changed)."""
+        """{rule: stats} or None if a preemption notice arrived (eval abandoned; no state was changed)."""
         np_state = np.random.get_state()
         out = {}
         try:
@@ -475,7 +659,7 @@ class Trainer:
                 out[rule] = dict(success_rate=rate, successes=int(round(rate * episodes)), episodes=episodes,
                                  **{k: float(v) for k, v in stats.items() if k.startswith('episode.')})
         except EvalAborted:
-            print('EVAL_ABORTED (SIGTERM)', flush=True)
+            print(f'EVAL_ABORTED ({self.stop_source})', flush=True)
             return None
         finally:
             np.random.set_state(np_state)
@@ -499,7 +683,7 @@ class Trainer:
                     data_gt_random=float((q_data > q_rand).mean()))
 
     def run_eval(self, nominal, step, rules, with_probe):
-        """Evaluate + probe, log, then checkpoint. On SIGTERM: checkpoint without it and exit."""
+        """Evaluate + probe, log, then checkpoint. On a preemption notice: checkpoint without it and exit."""
         print(f'EVAL_BEGIN nominal={nominal} step={step} phase={self.phase}', flush=True)
         res = self.evaluate(rules)
         if res is None:
@@ -579,6 +763,16 @@ class Trainer:
         self.metrics.log('env', step, row)
         self.env_acc = defaultdict(list)
 
+    def log_readout(self, phase, batch, step):
+        """ARB greedy-vs-expected readout diagnostics on the last main-replay batch (acarb agents only).
+
+        Uses its own RNG (fold_in of the step), so it does not change the training trajectory."""
+        if not hasattr(self.agent, 'readout_diagnostics'):
+            return
+        rng = jax.random.fold_in(jax.random.PRNGKey(FLAGS.seed + 104729), step)
+        diag = jax.device_get(self.agent.readout_diagnostics(batch, rng))
+        self.metrics.log('readout', self.ctr['env_steps'], dict(phase=phase, updates=step, **diag))
+
     # ---- phases ---------------------------------------------------------------------------------
     def progress(self, msg):
         print(f'PROGRESS {msg} t={time.time() - self.t_start:.1f}', flush=True)
@@ -650,6 +844,7 @@ class Trainer:
             u = self.ctr['pretrain_updates']
             if u % FLAGS.log_interval == 0 or u == FLAGS.pretrain_updates:
                 self.metrics.log('pretrain', self.ctr['env_steps'], dict(updates=u, **jax.device_get(info)))
+                self.log_readout('pretrain', batch, u)
                 self.progress(f'pretrain updates={u}')
 
     def phase_pretrain_eval(self):
@@ -683,6 +878,7 @@ class Trainer:
             s = self.ctr['env_steps']
             if s % FLAGS.log_interval == 0:
                 self.metrics.log('joint', s, dict(updates=self.ctr['joint_updates'], **jax.device_get(info)))
+                self.log_readout('joint', mb, s)
                 self.log_env(s)
                 self.progress(f'joint env_steps={s}')
         # Reaching online_steps is a safe point (no further env interaction), even mid-episode.
@@ -707,4 +903,4 @@ def main(_):
 
 
 if __name__ == '__main__':
-    app.run(main)
+    app.run(main, argv=argv_with_method_agent(sys.argv))
