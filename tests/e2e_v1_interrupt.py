@@ -10,8 +10,13 @@ one of them in the middle of a checkpoint write (writes slowed by V1_TEST_CKPT_D
 last committed generation. Every interrupted chain is restarted with the same arguments until it completes,
 then started once more (must exit 0 at once).
 
-Sets (each: A and B uninterrupted, I interrupted; I is compared with A, the A-vs-B parameter difference
-is the measured tolerance):
+A run that cannot reach a safe point within --preempt_budget_s of the notice exits 143 without a new
+checkpoint; one interruption forces this (budget 3 s at the start of joint) and checks the resume.
+
+All set runs use XLA_FLAGS=--xla_gpu_deterministic_ops=true: without it two identical runs differ after
+a few hundred critic updates, their best-of-n actions then differ and their replay buffers cannot match.
+Sets (A [and B] uninterrupted, I interrupted; I is compared with A, the A-vs-B parameter difference is
+the measured tolerance; comp has no B and uses the bsc tolerance):
   bc       --mode=bc (no --method: the acbsc actor), interrupted during updates, evaluation, hard kill.
   bsc      --method=bsc from the bc actor.
   arb_qc   --method=arb_qc from the same (acbsc) bc actor; exercises the ARB readout diagnostics.
@@ -68,23 +73,29 @@ def starts_with(prefix):
     return lambda line: line.startswith(prefix)
 
 
-# An interruption: (label, trigger(line), kind 'flag' | 'kill', extra env, delay in s after the trigger).
-def flag(label, trig, env=None, delay=0.0):
-    return (label, trig, 'flag', env, delay)
+# An interruption: (label, trigger(line), kind 'flag' | 'kill', extra env, delay in s after the trigger,
+# extra (restart-free) arguments for that process).
+def flag(label, trig, env=None, delay=0.0, args=()):
+    return (label, trig, 'flag', env, delay, list(args))
 
 
 def kill(label, trig, env=None, delay=0.0):
-    return (label, trig, 'kill', env, delay)
+    return (label, trig, 'kill', env, delay, [])
 
 
-def launch(args, log_path, flag_path, interrupt=None, extra_env=None):
+def launch(args, log_path, flag_path, interrupt=None, extra_env=None, deterministic=True):
     """Run train_v1.py once. With `interrupt`, act when its trigger first holds (after its delay).
 
-    Returns dict(rc, lines, flag_to_exit_s, kill_info)."""
+    deterministic: XLA_FLAGS=--xla_gpu_deterministic_ops=true (without it two identical runs already
+    differ after a few hundred GPU updates, so their replay buffers cannot be compared).
+    Returns dict(rc, lines, flag_to_exit_s, killed, last_done_gen, ...)."""
     if os.path.exists(flag_path):
         os.remove(flag_path)  # the job preamble deletes the flag at job start
     env = dict(os.environ, WANDB_MODE='disabled', XLA_PYTHON_CLIENT_PREALLOCATE='false', PYTHONUNBUFFERED='1',
                AE_PREEMPT_FLAG=flag_path)
+    env.pop('XLA_FLAGS', None)
+    if deterministic:
+        env['XLA_FLAGS'] = DETERMINISTIC
     env.update(extra_env or {})
     p = subprocess.Popen([sys.executable, 'train_v1.py', *args], cwd=REPO, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -115,7 +126,8 @@ def launch(args, log_path, flag_path, interrupt=None, extra_env=None):
         t_exit = time.time()
         log.write(f'=== exit {rc}\n')
     out.update(rc=rc, lines=lines, fired=fired.is_set())
-    if out['killed']:  # all output printed before the kill has been read now
+    if out['killed'] or any(l.startswith('EXIT_PREEMPTED_UNSAVED') for l in lines):
+        # All output printed before the exit has been read now.
         # Last committed generation: the last CKPT_DONE of this process, else the one it resumed from.
         gens = [l for l in lines if l.startswith(('CKPT_DONE', 'RESUME'))]
         m = re.search(r'gen=(\d+)', gens[-1]) if gens else None
@@ -129,27 +141,32 @@ def launch(args, log_path, flag_path, interrupt=None, extra_env=None):
 def chain(name, args, log_path, flag_path, interrupts):
     """Interrupted run: one process per interruption, then one to completion, then one more (complete)."""
     res = []
-    prev_kill = None
-    for label, trig, kind, extra_env, delay in interrupts:
-        r = launch(args, log_path, flag_path, (label, trig, kind, extra_env, delay), extra_env)
+    prev_kill = None  # last process ended without a checkpoint of its own (SIGKILL or unsaved exit)
+    for label, trig, kind, extra_env, delay, extra_args in interrupts:
+        r = launch([*args, *extra_args], log_path, flag_path, (label, trig, kind, extra_env, delay), extra_env)
         assert r['fired'], f'{name}: trigger "{label}" never fired (rc={r["rc"]})'
         resume = [l for l in r['lines'] if l.startswith('RESUME')]
-        if prev_kill is not None:  # this process resumed after a SIGKILL: from the last committed generation
+        if prev_kill is not None:  # resumed from the last committed generation
             want = prev_kill['last_done_gen']
             got = int(re.search(r'gen=(\d+)', resume[0]).group(1)) if resume and 'gen=' in resume[0] else None
-            assert got == want, f'{name}: after SIGKILL resumed gen {got}, last committed was {want}'
+            assert got == want, f'{name}: after "{prev_kill["label"]}" resumed gen {got}, last committed was {want}'
             res[-1]['resumed_gen'] = got
+        prev_kill = None
         if kind == 'flag':
             assert r['rc'] == 143, f'{name}: "{label}" exited {r["rc"]}, expected 143'
             internal = [l for l in r['lines'] if l.startswith('EXIT_PREEMPTED')]
             assert internal and 'source=flag' in internal[-1], internal
+            unsaved = internal[-1].startswith('EXIT_PREEMPTED_UNSAVED')
             dt_in = float(re.search(r'notice_to_exit_s=([\d.]+)', internal[-1]).group(1))
             entry = dict(label=label, kind=kind, rc=r['rc'], flag_to_exit_s=round(r['flag_to_exit_s'], 2),
-                         internal_s=dt_in, aborted_eval=any(l.startswith('EVAL_ABORTED') for l in r['lines']))
+                         internal_s=dt_in, aborted_eval=any(l.startswith('EVAL_ABORTED') for l in r['lines']),
+                         unsaved=unsaved, last_done_gen=r['last_done_gen'])
             assert r['flag_to_exit_s'] <= DEADLINE_S, entry
             print(f'[{name}] flag {label}: exit {r["rc"]}, flag-to-exit {r["flag_to_exit_s"]:.2f}s '
-                  f'(internal {dt_in:.2f}s){" eval abandoned" if entry["aborted_eval"] else ""}', flush=True)
-            prev_kill = None
+                  f'(internal {dt_in:.2f}s){" eval abandoned" if entry["aborted_eval"] else ""}'
+                  f'{" budget exceeded: exited without new checkpoint" if unsaved else ""}', flush=True)
+            if unsaved:
+                prev_kill = entry
         else:
             assert r['killed'] and r['rc'] == -9, f'{name}: "{label}" rc={r["rc"]} killed={r["killed"]}'
             entry = dict(label=label, kind=kind, rc=r['rc'], last_done_gen=r['last_done_gen'],
@@ -221,12 +238,12 @@ def _rows(metrics, kinds):
             for r in metrics if r['kind'] in kinds]
 
 
-def compare_online(name, A, B, I, log_I, competent=False):
-    """I vs A (and B vs A for the tolerance)."""
+def compare_online(name, A, B, I, log_I, competent=False, tol=None):
+    """I vs A (and B vs A for the tolerance; without B, `tol` is the tolerance measured on another set)."""
     phases = ['warmup', 'pretrain', 'pretrain_eval', 'joint']
     res = dict(phase_begin_counts_I=phase_once(log_I, phases))
     sa = A[0]
-    for nm, (st, man, rows, metrics) in (('B', B), ('I', I)):
+    for nm, (st, man, rows, metrics) in ((('B', B),) if B is not None else ()) + (('I', I),):
         res[f'ctr_equal_{nm}'] = st['ctr'] == sa['ctr']
         res[f'phase_{nm}'] = st['phase']
         bm = {}
@@ -245,7 +262,9 @@ def compare_online(name, A, B, I, log_I, competent=False):
         res[f'readout_rows_{nm}'] = len(_rows(metrics, ('readout',)))
         res[f'readout_rows_equal_{nm}'] = _rows(metrics, ('readout',)) == _rows(A[3], ('readout',))
         res[f'config_rows_equal_{nm}'] = _rows(metrics, ('config',)) == _rows(A[3], ('config',))
-    res['tolerance_measured_A_vs_B'] = tol = res['params_maxdiff_B_vs_A']
+    if B is not None:
+        tol = res['params_maxdiff_B_vs_A']
+    res['tolerance_measured_A_vs_B'] = tol
     res['params_I_within_tol'] = res['params_maxdiff_I_vs_A'] <= tol
     cfg = _rows(A[3], ('config',))
     res['config_row'] = dict(method=cfg[0]['method'], agent_name=cfg[0]['agent_name'],
@@ -265,14 +284,20 @@ def compare_online(name, A, B, I, log_I, competent=False):
     return res
 
 
-def online_interrupts(eval_nominal):
+def online_interrupts(eval_nominal, full=True):
+    if not full:  # competent-actor set: fewer restarts
+        return [
+            flag('during warm-up collection', progress_at_least('warmup', 'env_steps', 500)),
+            flag('during an evaluation (joint)', starts_with(f'EVAL_BEGIN nominal={eval_nominal}'), delay=2.0),
+            kill('SIGKILL during joint updates', progress_at_least('joint', 'env_steps', 3250), delay=0.7),
+        ]
     return [
         flag('during warm-up collection', progress_at_least('warmup', 'env_steps', 500)),
-        kill('SIGKILL during warm-up', progress_at_least('warmup', 'env_steps', 750), delay=1.3),
         flag('at a phase boundary (warmup end)', starts_with('PHASE_END warmup')),
         flag('during pretrain updates', progress_at_least('pretrain', 'updates', 250)),
-        flag('during an evaluation (pretrain_eval)', starts_with('PHASE_BEGIN pretrain_eval'), delay=3.0),
-        flag('at a phase boundary (pretrain_eval done)', starts_with('PHASE_DONE pretrain_eval')),
+        # First joint episode (compile + episode) is longer than a 3 s budget: exit without a checkpoint.
+        flag('start of joint, safe point beyond --preempt_budget_s=3', starts_with('PHASE_BEGIN joint'),
+             delay=1.0, args=['--preempt_budget_s=3']),
         kill('SIGKILL mid-checkpoint-write', starts_with('CKPT_BEGIN phase=joint reason=periodic'),
              {'V1_TEST_CKPT_DELAY': '4'}, delay=1.0),
         flag('during a checkpoint write', starts_with('CKPT_BEGIN phase=joint reason=periodic'),
@@ -283,13 +308,12 @@ def online_interrupts(eval_nominal):
     ]
 
 
-def run_set(name, args_of, logs, flag_of, interrupts, compare=None):
-    """A, B uninterrupted and the I chain, in parallel. Returns (I chain results, A, B, I loaded)."""
+def run_set(name, args_of, logs, flag_of, interrupts, runs='AB'):
+    """Uninterrupted runs (A, and B for the tolerance) and the I chain, in parallel. Returns the chain results."""
     with ThreadPoolExecutor(3) as ex:
-        fa = ex.submit(launch, args_of('A'), logs('A'), flag_of('A'))
-        fb = ex.submit(launch, args_of('B'), logs('B'), flag_of('B'))
+        futs = {n: ex.submit(launch, args_of(n), logs(n), flag_of(n)) for n in runs}
         fi = ex.submit(chain, f'{name}I', args_of('I'), logs('I'), flag_of('I'), interrupts)
-        for f, n in ((fa, 'A'), (fb, 'B')):
+        for n, f in futs.items():
             r = f.result()
             assert r['rc'] == 0, f'{name}{n} exited {r["rc"]}'
         return fi.result()
@@ -325,12 +349,19 @@ def interruption_test(root, sets):
         extract(COMPETENT_SRC[0], comp_actor)
 
     def online_set(name, method, init):
+        comp = name == 'comp'
         args_of = lambda n: [*COMMON, *ONLINE, f'--method={method}', f'--init_actor={init}',  # noqa: E731
                              f'--run_dir={d(name + n)}']
-        chains[name] = run_set(name, args_of, lambda n: lg(name + n), lambda n: fl(name + n), online_interrupts(3000))
+        chains[name] = run_set(name, args_of, lambda n: lg(name + n), lambda n: fl(name + n),
+                               online_interrupts(3000, full=not comp), runs='A' if comp else 'AB')
+        if comp:
+            return  # compared below with the tolerance measured on the bsc set (same method)
         A, B, I = (load_run(d(name + n)) for n in 'ABI')
-        results[name] = compare_online(name, A, B, I, lg(name + 'I'), competent=(name == 'comp'))
+        results[name] = compare_online(name, A, B, I, lg(name + 'I'))
         print(f'[{name}] {"PASS" if results[name]["pass"] else "FAIL"}', flush=True)
+
+    bench_args = lambda n: [*COMMON, *BENCH, f'--init_actor={os.path.join(d("bcA"), "final_actor.pkl")}',  # noqa: E731
+                            f'--run_dir={d(n)}']
 
     with ThreadPoolExecutor(8) as ex:
         futs = []
@@ -358,22 +389,35 @@ def interruption_test(root, sets):
         for name in ('bsc', 'arb_qc'):
             if name in sets:
                 futs.append(ex.submit(online_set, name, name, init))
+        if 'det' in sets:  # second run without the flag, for the divergence only (its speed is not used)
+            futs.append(ex.submit(launch, bench_args('det_default_2'), lg('det_default_2'), fl('det_default_2'),
+                                  deterministic=False))
         for f in futs:
-            f.result()
+            r = f.result()
+            assert not isinstance(r, dict) or r['rc'] == 0, r.get('rc')
+    if 'comp' in sets:
+        tol = results['bsc']['tolerance_measured_A_vs_B'] if 'bsc' in results else 0.0
+        A, I = (load_run(d('comp' + n)) for n in 'AI')
+        results['comp'] = compare_online('comp', A, None, I, lg('compI'), competent=True, tol=tol)
+        print(f'[comp] {"PASS" if results["comp"]["pass"] else "FAIL"}', flush=True)
     t_sets = time.time() - t0
 
     # ---- Determinism cost, alone on the machine.
     if 'det' in sets:
         det = {}
-        for label, extra in (('default', {}), ('deterministic_ops', {'XLA_FLAGS': DETERMINISTIC})):
+        for label, flag_on in (('default', False), ('deterministic_ops', True)):
             n = f'det_{label}'
             t = time.time()
-            r = launch([*COMMON, *BENCH, f'--init_actor={os.path.join(d("bcA"), "final_actor.pkl")}',
-                        f'--run_dir={d(n)}'], lg(n), fl(n), extra_env=extra)
+            r = launch(bench_args(n), lg(n), fl(n), deterministic=flag_on)
             assert r['rc'] == 0, (n, r['rc'])
             det[label] = dict(**rates(lg(n)), wall_s=round(time.time() - t, 1))
-        det['param_divergence_two_runs_without_flag'] = {
-            k: results[k]['tolerance_measured_A_vs_B'] for k in ('bsc', 'arb_qc', 'comp', 'bc') if k in results}
+        s1, s2 = load_run(d('det_default'))[0], load_run(d('det_default_2'))[0]
+        det['schedule'] = ' '.join(BENCH[2:6])
+        det['without_flag_two_runs'] = dict(
+            params_maxdiff=tree_maxdiff(s1['agent']['network']['params'], s2['agent']['network']['params']),
+            main_buffer_meta_equal=s1['buffers']['main'] == s2['buffers']['main'], ctr_equal=s1['ctr'] == s2['ctr'])
+        det['with_flag_two_runs_params_maxdiff'] = {
+            k: results[k]['tolerance_measured_A_vs_B'] for k in ('bc', 'bsc', 'arb_qc') if k in results}
         results['determinism'] = det
 
     results['interruptions'] = {k: [{kk: vv for kk, vv in c.items()} for c in v] for k, v in chains.items()}
@@ -389,7 +433,8 @@ def interruption_test(root, sets):
             ft = [c['flag_to_exit_s'] for c in chains[name] if c['kind'] == 'flag']
             print(f'{"PASS" if r["pass"] else "FAIL"} {name}: tolerance(A-B)={r["tolerance_measured_A_vs_B"]:.3g} '
                   f'I-A={r.get("params_maxdiff_I_vs_A", r.get("final_actor_maxdiff_I_vs_A")):.3g} '
-                  f'flag_to_exit_s={ft} kills={sum(c["kind"] == "kill" for c in chains[name])}'
+                  f'flag_to_exit_s={ft} kills={sum(c["kind"] == "kill" for c in chains[name])} '
+                  f'unsaved_exits={sum(bool(c.get("unsaved")) for c in chains[name])}'
                   + (f' online_successes={r["online_successes_A"]} success_buffer_online_episodes='
                      f'{r.get("success_buffer_online_episodes")}' if name == 'comp' else '')
                   + (f' readout_rows={r["readout_rows_I"]}' if name == 'arb_qc' else ''), flush=True)

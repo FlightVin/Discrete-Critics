@@ -16,7 +16,9 @@ Adam step and critic-only / actor-only updates leave the other optimiser's state
 Preemption: if env AE_PREEMPT_FLAG names a file, its appearance (written by the job preamble about two
 minutes before the kill) stops the run at the next safe point (episode boundary during env interaction,
 any update boundary otherwise; a running evaluation is abandoned), which writes a checkpoint and exits
-with code 143. A background thread polls the file every second; safe points also check it. SIGTERM is
+with code 143. A background thread polls the file every second; safe points also check it. If no safe
+point is reached within --preempt_budget_s of the file's mtime (a long episode, a first-time compile),
+the run exits 143 without a new checkpoint and resumes from the last committed one. SIGTERM is
 treated the same way, best effort only (on Babel the kill follows it within a second). Started again
 with the same arguments the run resumes from the committed checkpoint; a finished run exits 0 at once.
 Checkpoints are also written every --ckpt_minutes, after each evaluation and at each phase end. See
@@ -87,6 +89,8 @@ flags.DEFINE_integer('eval_seed', 1000, 'Eval env i is reseeded with eval_seed +
 flags.DEFINE_integer('probe_states', 1024, 'Fixed demo states for the critic probe.')
 flags.DEFINE_integer('log_interval', 5000, 'Log interval (updates / env steps).')
 flags.DEFINE_float('ckpt_minutes', 20.0, 'Periodic checkpoint interval (minutes) at safe points.')
+flags.DEFINE_float('preempt_budget_s', 60.0, 'After a preemption notice: if no safe point has been reached '
+                   'this many seconds after it, exit without a new checkpoint (resume from the last one).')
 
 flags.DEFINE_string('project_name', 'qc', 'W&B project.')
 flags.DEFINE_string('run_group', 'v1', 'W&B group.')
@@ -107,7 +111,7 @@ if __name__ == '__main__':
 config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 
 # Flags that may change between restarts of the same run.
-RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval'}
+RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval', 'preempt_budget_s'}
 EXIT_PREEMPTED = 143
 ONLINE_PHASES = ['warmup', 'pretrain', 'pretrain_eval', 'joint', 'done']
 BC_PHASES = ['bc', 'done']
@@ -385,6 +389,7 @@ class Trainer:
         self.stop_source = None
         self.pid = os.getpid()
         self.done_msg = None
+        self.ckpt_lock = threading.Lock()
         signal.signal(signal.SIGTERM, self._on_sigterm)
         flag = os.environ.get('AE_PREEMPT_FLAG')
         self.watcher = PreemptWatcher(flag, self._on_flag) if flag else None
@@ -404,6 +409,7 @@ class Trainer:
         if not self.stop_requested:
             self.t_stop_ref, self.stop_source = time.time(), 'sigterm'
             print(f'SIGTERM_RECEIVED t={self.t_stop_ref:.3f} (best effort)', flush=True)
+            threading.Thread(target=self._deadline, daemon=True, name='preempt-deadline').start()
         self.stop_requested = True
 
     def _on_flag(self, mtime):
@@ -411,7 +417,27 @@ class Trainer:
         if not self.stop_requested:
             self.t_stop_ref, self.stop_source = mtime, 'flag'
             print(f'PREEMPT_FLAG_SEEN age_s={time.time() - mtime:.2f} phase={self.phase_name()}', flush=True)
+            threading.Thread(target=self._deadline, daemon=True, name='preempt-deadline').start()
         self.stop_requested = True
+
+    def _deadline(self):
+        """The next safe point can be far (an episode, a first-time compile, a slow machine). If it has not
+        been reached preempt_budget_s after the notice, exit now: the committed checkpoint stays valid and
+        the work since it is redone after the restart (as after a hard kill)."""
+        time.sleep(max(0.0, self.t_stop_ref + FLAGS.preempt_budget_s - time.time()))
+        with self.ckpt_lock:  # never cut a checkpoint write short (harmless, but it would be wasted)
+            dt = time.time() - self.t_stop_ref
+            print(f'EXIT_PREEMPTED_UNSAVED source={self.stop_source} notice_to_exit_s={dt:.2f} '
+                  f'phase={self.phase_name()} committed_gen={self.store.gen}', flush=True)
+            try:
+                with open(os.path.join(self.run_dir, 'preemptions.jsonl'), 'a') as f:
+                    f.write(json.dumps(dict(time=time.time(), source=self.stop_source, unsaved=True,
+                                            notice_to_exit_s=round(dt, 3), gen=self.store.gen)) + '\n')
+                for proc in getattr(getattr(self, 'eval_envs', None), 'processes', []):
+                    proc.terminate()
+            finally:
+                sys.stdout.flush()
+                os._exit(EXIT_PREEMPTED)
 
     def phase_name(self):
         return getattr(self, 'phase', None)
@@ -563,8 +589,9 @@ class Trainer:
             for k, b in self.buffers.items():
                 segs[k] = b.new_segment()  # before state_dict(): the saved meta must include it
                 keep[k] = b.k_lo
-        state = self.state_dict()
-        info = self.store.save(state, segs, keep, meta=dict(phase=self.phase, ctr=dict(self.ctr)))
+        with self.ckpt_lock:
+            state = self.state_dict()
+            info = self.store.save(state, segs, keep, meta=dict(phase=self.phase, ctr=dict(self.ctr)))
         self.t_last_ckpt = time.time()
         print(f'CKPT_DONE gen={info["gen"]} reason={reason} state_mb={info["state_bytes"] / 1e6:.1f} '
               f'segment_mb={info["segment_bytes"] / 1e6:.1f} seconds={info["t_total"]:.2f}', flush=True)
