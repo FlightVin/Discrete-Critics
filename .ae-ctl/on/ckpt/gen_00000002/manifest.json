@@ -1,0 +1,36 @@
+{
+ "gen": 2,
+ "time": 1792659219.5166168,
+ "meta": {
+  "phase": "pretrain_eval",
+  "ctr": {
+   "env_steps": 1200,
+   "warmup_env_steps": 1200,
+   "episodes": 3,
+   "warmup_episodes": 3,
+   "warmup_failures": 3,
+   "warmup_successes": 0,
+   "joint_successes": 0,
+   "joint_failures": 0,
+   "pretrain_updates": 50
+  }
+ },
+ "files": {
+  "state.pkl": {
+   "size": 48056324,
+   "sha256": "7387b114ff19977d12cbf6b7a8ce3124041029d3787e7444277bb87f65fdde1b"
+  }
+ },
+ "segments": {
+  "main": [
+   {
+    "file": "main_000000000000_000000001200_g00000001.npz",
+    "k_from": 0,
+    "k_to": 1200,
+    "size": 280476,
+    "crc": 4001200093
+   }
+  ],
+  "success": []
+ }
+}
