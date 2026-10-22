@@ -888,6 +888,8 @@ class Trainer:
         row = {}
         for rule, r in res.items():
             row.update({f'{rule}/{k}': v for k, v in r.items()})
+        if os.environ.get('V1_TEST_RAISE_IN_PRETRAIN_EVAL'):  # test hook: where job 10888854 failed (probe)
+            raise ValueError('V1_TEST_RAISE_IN_PRETRAIN_EVAL')
         row.update({f'probe/{k}': v for k, v in self.probe().items()})
         self.metrics.log('pretrain_eval', self.ctr['env_steps'], row)
         print('EVAL ' + json.dumps({k: v for k, v in row.items() if 'episode.' not in k}), flush=True)
@@ -932,8 +934,51 @@ def main(_):
     if FLAGS.mode == 'online':
         assert FLAGS.init_actor, '--init_actor is required for --mode=online'
     trainer = Trainer()
-    trainer.setup()
-    trainer.run()
+    try:
+        trainer.setup()
+        trainer.run()
+    except SystemExit:
+        raise  # preemption (143), refused config / args (2): unchanged
+    except BaseException:
+        exit_on_exception(trainer)
+
+
+EXIT_EXCEPTION = 1
+EXCEPTION_CLEANUP_S = 20.0
+
+
+def exit_on_exception(trainer):
+    """Unhandled exception: print it, close the eval envs (bounded) and end the process with code 1.
+
+    A normal interpreter exit can hang for a long time here: it joins the eval env worker processes and
+    other non-daemon threads (W&B). os._exit skips that; workers still alive after the bounded close are
+    terminated."""
+    import traceback
+    t0 = time.time()
+    traceback.print_exc()
+    print(f'EXIT_EXCEPTION phase={trainer.phase_name()} ctr={dict(getattr(trainer, "ctr", {}))}', flush=True)
+
+    def cleanup():
+        trainer.close_envs()
+        try:
+            import wandb
+            wandb.finish(exit_code=EXIT_EXCEPTION)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=cleanup, daemon=True, name='exception-cleanup')
+    t.start()
+    t.join(EXCEPTION_CLEANUP_S)
+    for proc in getattr(getattr(trainer, 'eval_envs', None), 'processes', []):
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception:
+            pass
+    print(f'EXIT_EXCEPTION_DONE cleanup_s={time.time() - t0:.2f} cleanup_finished={not t.is_alive()}', flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(EXIT_EXCEPTION)
 
 
 if __name__ == '__main__':
