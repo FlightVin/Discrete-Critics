@@ -204,7 +204,8 @@ def interruption_test(root):
         res[f'params_maxdiff_{name}_vs_A'] = tree_maxdiff(st['agent'], sa['agent'])
         res[f'np_rng_equal_{name}'] = bool(np.array_equal(st['np_rng'][1], sa['np_rng'][1]))
         pe = lambda m: [(r['phase']) for r in m if r['kind'] == 'phase_end']  # noqa: E731
-        ev = lambda m: [{k: v for k, v in r.items() if k != 'time'} for r in m if r['kind'] in ('eval', 'pretrain_eval')]  # noqa: E731
+        ev = lambda m: [{k: v for k, v in r.items() if k != 'time' and 'duration' not in k}  # noqa: E731
+                        for r in m if r['kind'] in ('eval', 'pretrain_eval')]  # wall-clock fields excluded
         res[f'phase_end_rows_{name}'] = pe(metrics)
         res[f'eval_rows_equal_{name}'] = ev(metrics) == ev(A[3])
         res[f'metrics_rows_{name}_vs_A'] = (len(metrics), len(A[3]))

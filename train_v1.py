@@ -309,6 +309,12 @@ class Trainer:
             agent = agent.replace(network=network)
         self.agent = agent
 
+        # Eval envs before seeding/restoring: AsyncVectorEnv builds a dummy env in this process, and
+        # robomimic's make_env reseeds numpy's global RNG. Keep the global state untouched regardless.
+        np_state = np.random.get_state()
+        self.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, FLAGS.n_eval_envs, seed=FLAGS.eval_seed)
+        np.random.set_state(np_state)
+
         random.seed(FLAGS.seed)
         np.random.seed(FLAGS.seed)
         self.action_key = jax.random.PRNGKey(FLAGS.seed + 7919)
@@ -340,7 +346,6 @@ class Trainer:
 
         self.metrics = MetricsLog(os.path.join(self.run_dir, 'metrics.jsonl'), self.metrics_offset)
         self.setup_wandb()
-        self.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, FLAGS.n_eval_envs, seed=FLAGS.eval_seed)
         self.t_last_ckpt = time.time()
         self.ob, self.action_queue, self.ep_rows = None, [], []
 
