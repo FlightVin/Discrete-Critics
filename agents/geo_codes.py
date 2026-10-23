@@ -116,8 +116,8 @@ def label_support(c, rem, den, mode):
         raise ValueError(f'unknown label_mode {mode!r}')
     tokens = c[..., None] + jnp.arange(-1, 2, dtype=jnp.int32)
     masses = jnp.stack(masses, axis=-1)
-    # f = 0 -> exactly zero mass on c + 1 (never index it).
-    masses = masses.at[..., 2].set(jnp.where(rem > 0, masses[..., 2], 0.0))
+    if mode != 'noisy_fixed':  # c + 1 carries mass proportional to f: f = 0 -> exactly zero (never indexed)
+        masses = masses.at[..., 2].set(jnp.where(rem > 0, masses[..., 2], 0.0))
     return tokens, masses
 
 
