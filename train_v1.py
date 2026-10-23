@@ -488,7 +488,8 @@ class Trainer:
         self.watcher = PreemptWatcher(flag, self._on_flag) if flag else None
 
         self.run_dir = FLAGS.run_dir
-        os.makedirs(self.run_dir, exist_ok=True)
+        if self.run_dir:  # make_probe_candidates: none
+            os.makedirs(self.run_dir, exist_ok=True)
         self.mode = FLAGS.mode
         self.bc_select = None  # actor selection state (bc with --bc_select_threshold >= 0; set in setup)
         self.store = None
@@ -1145,8 +1146,99 @@ class Trainer:
         self.log_env(self.ctr['env_steps'])
 
 
+def build_probe_trainer():
+    """Trainer with config, demos, agent (actor from --init_actor if given) and probe states only: no eval
+    envs, no replay, no checkpoint store, no W&B."""
+    tr = Trainer()
+    # make_probe_candidates needs only the BC flow actor (same network in every agent): bsc's agent by default.
+    method = FLAGS.method or ('bsc' if tr.mode == 'make_probe_candidates' else None)
+    config = resolve_agent_config(method, FLAGS.agent, sys.argv)
+    config['horizon_length'] = FLAGS.horizon_length
+    check_agent_config(tr.mode, config)
+    tr.config, tr.H = config, FLAGS.horizon_length
+    env, eval_env, ds, _ = make_env_and_datasets(FLAGS.env_name)
+    for e in (env, eval_env):
+        if hasattr(e, 'close'):
+            e.close()
+    tr.demos = process_demos(ds, FLAGS.env_name, tr.H, FLAGS.sparse)
+    agent = agents[config['agent_name']].create(
+        FLAGS.seed, tr.demos['observations'][0], tr.demos['actions'][0], config)
+    tr.init_actor_info = None
+    if FLAGS.init_actor:
+        agent, tr.init_actor_info = load_actor(agent, FLAGS.init_actor, tr.H)
+    tr.agent = split_optimizer(agent)
+    tr.setup_probe(config)
+    return tr
+
+
+def make_probe_candidates():
+    """--mode=make_probe_candidates: the --init_actor's actions for the fixed probe noise (RandomState(1)) at
+    the fixed probe states, written to --out (actions, indices, observations, actions_sha256)."""
+    assert FLAGS.init_actor and FLAGS.out, '--init_actor and --out are required'
+    tr = build_probe_trainer()
+    cands = make_candidates(tr.agent, tr.probe_obs, tr.probe_noises).astype(np.float32)
+    sha = hashlib.sha256(np.ascontiguousarray(cands).tobytes()).hexdigest()
+    import io
+    buf = io.BytesIO()
+    np.savez(buf, actions=cands, indices=np.asarray(tr.probe_idx), observations=tr.probe_obs.astype(np.float32),
+             actions_sha256=np.asarray(sha), init_actor_sha256=np.asarray(file_sha256(FLAGS.init_actor)),
+             env_name=np.asarray(FLAGS.env_name), horizon_length=np.asarray(tr.H))
+    write_atomic(FLAGS.out, buf.getvalue())
+    print(f'PROBE_CANDIDATES out={FLAGS.out} shape={cands.shape} actions_sha256={sha} '
+          f'file_sha256={file_sha256(FLAGS.out)}', flush=True)
+
+
+def read_committed_state(src_run_dir):
+    """(state, manifest) of the committed checkpoint of a run dir, read-only: only opens files for reading
+    (no CheckpointStore: its load() cleans up uncommitted generations)."""
+    root = os.path.join(src_run_dir, 'ckpt')
+    with open(os.path.join(root, 'LATEST')) as f:
+        name = f.read().strip()
+    gdir = os.path.join(root, name)
+    with open(os.path.join(gdir, 'manifest.json')) as f:
+        man = json.load(f)
+    with open(os.path.join(gdir, 'state.pkl'), 'rb') as f:
+        data = f.read()
+    info = man['files']['state.pkl']
+    assert len(data) == info['size'] and hashlib.sha256(data).hexdigest() == info['sha256'], f'{gdir} is corrupt'
+    return pickle.loads(data), man
+
+
+def probe_ckpt():
+    """--mode=probe_ckpt: both probes on the agent of --src_run_dir's committed checkpoint -> probe_ckpt.json."""
+    assert FLAGS.src_run_dir and FLAGS.probe_candidates, '--src_run_dir and --probe_candidates are required'
+    src, out_dir = os.path.realpath(FLAGS.src_run_dir), os.path.realpath(FLAGS.run_dir)
+    assert src != out_dir and not out_dir.startswith(src + os.sep), '--run_dir must lie outside --src_run_dir'
+    state, man = read_committed_state(src)
+    tr = build_probe_trainer()
+    tr.agent = flax.serialization.from_state_dict(tr.agent, state['agent'])
+    row = tr.probe_row()
+    ctr = dict(state['ctr'])
+    out = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], ctr=ctr,
+               step=int(ctr.get('env_steps', 0) or ctr.get('bc_updates', 0)), method=FLAGS.method,
+               agent_name=tr.config['agent_name'], agent=strip_later_agent_defaults(tr.config.to_dict()),
+               probe_candidates=tr.probe_cands_info, **row)
+    write_atomic(os.path.join(FLAGS.run_dir, 'probe_ckpt.json'),
+                 (json.dumps(out, indent=1, default=str) + '\n').encode())
+    print('PROBE_CKPT ' + json.dumps({k: v for k, v in out.items() if k != 'agent'}, default=str), flush=True)
+    if FLAGS['project_name'].present:
+        import wandb
+        import secrets
+        tr.wandb_id = secrets.token_hex(6)
+        tr.setup_wandb()
+        wandb.config.update(dict(v1=dict(mode='probe_ckpt', src_run_dir=src, gen=man['gen'])), allow_val_change=True)
+        wandb.log({**{k: v for k, v in row.items()}, 'global_step': out['step']})
+        wandb.finish()
+
+
 def main(_):
-    assert FLAGS.run_dir, '--run_dir is required'
+    assert FLAGS.run_dir or FLAGS.mode == 'make_probe_candidates', '--run_dir is required'
+    if FLAGS.mode == 'make_probe_candidates':
+        make_probe_candidates()
+        return
+    if FLAGS.mode == 'probe_ckpt':
+        probe_ckpt()
+        return
     if FLAGS.mode == 'eval_actor':
         assert FLAGS.init_actor, '--init_actor is required for --mode=eval_actor'
         trainer = Trainer()
