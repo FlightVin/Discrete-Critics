@@ -43,7 +43,8 @@ def e_args(label, cands):
 
 def rows(run_dir):
     with open(os.path.join(run_dir, 'metrics.jsonl')) as f:
-        return [{k: v for k, v in json.loads(l).items() if k != 'time'} for l in f]
+        # wall-clock fields excluded (as tests/e2e_v1_interrupt._rows)
+        return [{k: v for k, v in json.loads(l).items() if k != 'time' and 'duration' not in k} for l in f]
 
 
 def tree_hash(root):
@@ -118,7 +119,8 @@ def test_e_shapes_run_every_phase(label, runs):
     m = rows(d / f'E_{label}')
     cfg = [x for x in m if x['kind'] == 'config']
     assert len(cfg) == 1
-    assert cfg[0]['agent']['arb_label'] == label and cfg[0]['agent']['arb_readout'] == 'sample_mean'
+    # arb_label='hard' is a later default: left out of the config row (as of args.json)
+    assert cfg[0]['agent'].get('arb_label', 'hard') == label and cfg[0]['agent']['arb_readout'] == 'sample_mean'
     assert cfg[0]['agent']['arb_readout_temp'] == 0.7 and cfg[0]['agent']['critic_target_bon'] is False
     assert len(cfg[0]['probe_candidates']['sha256']) == 64 and cfg[0]['replay_rng'] == 'separate'
     assert [x['phase'] for x in m if x['kind'] == 'phase_end'] == ['warmup', 'pretrain', 'pretrain_eval', 'joint']
