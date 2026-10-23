@@ -12,7 +12,8 @@ written so far, k_lo the oldest row still held.
 A sequence start is valid iff its H steps are all held and contiguous in write order: demo starts
 [0, D - H] and online starts k in [k_lo, n - H]. Sequences never cross from demos into online data, nor
 across the ring's write head. Sampling is uniform over valid starts and draws from numpy's global RNG,
-like utils/datasets.py: Dataset.sample_sequence, and returns the same dict.
+like utils/datasets.py: Dataset.sample_sequence, and returns the same dict; with `rng` (a
+np.random.Generator, train_v1 --replay_rng=separate) it draws from that generator instead.
 
 Persistence is incremental: `new_segment()` returns the rows written since the last call (write-order
 [seg_from, n)). Rows are final once written, because train_v1 only checkpoints at episode boundaries
@@ -25,8 +26,11 @@ FIELDS = ('observations', 'actions', 'rewards', 'terminals', 'masks', 'next_obse
 
 
 class SeqReplay:
-    def __init__(self, demos, capacity, horizon, episodic):
-        """demos: dict of arrays with FIELDS (the processed demo dataset). episodic: whole-episode eviction."""
+    def __init__(self, demos, capacity, horizon, episodic, rng=None):
+        """demos: dict of arrays with FIELDS (the processed demo dataset). episodic: whole-episode eviction.
+        rng: np.random.Generator for sampling (None: numpy's global RNG). Not part of meta(): its owner
+        saves and restores its state."""
+        self.rng = rng
         self.D = int(len(demos['observations']))
         self.cap = int(capacity)
         self.R = self.cap - self.D
@@ -111,7 +115,10 @@ class SeqReplay:
     def sample_starts(self, batch_size):
         """Uniform over valid starts: (start slot, is_online, write-order index or 0 for demos)."""
         nd, total = self.num_demo_starts, self.num_valid_starts
-        u = np.random.randint(total, size=batch_size)
+        if self.rng is None:
+            u = np.random.randint(total, size=batch_size)
+        else:
+            u = self.rng.integers(total, size=batch_size)
         online = u >= nd
         k0 = np.where(online, self.k_lo + (u - nd), 0)
         idxs = np.where(online, self.slot(k0), u)
