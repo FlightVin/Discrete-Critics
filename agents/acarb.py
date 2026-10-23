@@ -7,9 +7,38 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 
+from agents import geo_codes
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, ARCritic, ensemblize
+
+GEO1_LABELS = ('hard', 'twohot_last', 'twohot_last2', 'twohot_all')
+VOCABS = ('ordinary', 'redundant')
+ROLLINS = ('canonical',) + geo_codes.ROLLIN_MODES
+# geo2b: the allowed (arb_label, arb_rollin) pairs of the redundant vocabulary.
+GEO_COMBOS = {('corrective', 'corrective'): 'E5', ('corrective', 'model_mix'): 'E6', ('corrective', 'fixed'): 'E7',
+              ('noisy_fixed', 'fixed'): 'E8', ('noisy_resid', 'fixed'): 'E9'}
+
+
+def geo_config_errors(config):
+    """Errors (list of str) for arb_vocab / arb_label / arb_rollin combinations outside the allowed set."""
+    get = lambda key, default: config[key] if key in config else default
+    vocab, label, rollin = get('arb_vocab', 'ordinary'), get('arb_label', 'hard'), get('arb_rollin', 'canonical')
+    if vocab not in VOCABS or label not in GEO1_LABELS + geo_codes.LABEL_MODES or rollin not in ROLLINS:
+        return [f'unknown arb_vocab={vocab} / arb_label={label} / arb_rollin={rollin}']
+    errors = []
+    if vocab == 'ordinary':
+        if label in geo_codes.LABEL_MODES or rollin != 'canonical':
+            errors.append(f'arb_label={label} arb_rollin={rollin} needs arb_vocab=redundant')
+        return errors
+    if (label, rollin) not in GEO_COMBOS:
+        errors.append(f'arb_vocab=redundant allows (arb_label, arb_rollin) in {sorted(GEO_COMBOS)}, '
+                      f'got ({label}, {rollin})')
+    if get('arb_readout', None) != 'sample_mean' or get('arb_value', 'bsc') != 'bsc':
+        errors.append('arb_vocab=redundant needs arb_readout=sample_mean and arb_value=bsc')
+    if (get('arb_base', None), get('arb_length', None)) != (10, geo_codes.LENGTH):
+        errors.append('arb_vocab=redundant needs arb_base=10 and arb_length=3')
+    return errors
 
 
 def ar_bin(y, base, length):
@@ -152,6 +181,12 @@ class ACARBAgent(flax.struct.PyTreeNode):
         critic_fn = self.network.select('target_critic' if target else 'critic')
         B, L = self.config['arb_base'], self.config['arb_length']
         readout = readout or self.config['arb_readout']
+        if self._redundant():
+            if readout == 'greedy':
+                n = self._decode(critic_fn(observations, actions))
+                return jnp.clip(n, 0, B ** L - 1).astype(jnp.float32) / B ** L
+            if readout != 'sample_mean':
+                raise ValueError(f'arb_readout={readout} is not implemented for arb_vocab=redundant')
         if readout == 'greedy':
             return ar_decode(critic_fn(observations, actions), B)
         if readout == 'sample':
@@ -167,34 +202,56 @@ class ACARBAgent(flax.struct.PyTreeNode):
     def _cfg(self, key, default):
         return self.config[key] if key in self.config else default
 
+    def _redundant(self):
+        return self._cfg('arb_vocab', 'ordinary') == 'redundant'
+
+    def _decode(self, classes):
+        """Class indices (..., L) -> integer value n (int32, units of B^-L), NOT clipped. Redundant vocabulary:
+        tokens = classes - 22, n = 100 z1 + 10 z2 + z3 (signed); ordinary: the digit code."""
+        if self._redundant():
+            return geo_codes.decode_units(geo_codes.class_to_token(classes))
+        return ar_code(classes, self.config['arb_base'])
+
     def readout_den(self):
         """K_den = B^L * num_qs * M: the sample_mean ensemble value is S / K_den."""
         return self.config['arb_base'] ** self.config['arb_length'] * self.config['num_qs'] * \
             self.config['arb_readout_samples']
 
-    def _percopy_critic(self, target):
+    def _percopy_critic(self, target, params=None):
         """Teacher-forced critic whose digits argument has a leading num_qs axis (one prefix per copy).
 
         Same module and parameters as the 'critic' / 'target_critic' ensemble (nn.vmap over the same
-        params); only the digits are mapped over the copies instead of broadcast."""
+        params); only the digits are mapped over the copies instead of broadcast. `params` (the critic
+        module's params, e.g. grad_params['modules_critic']) overrides the stored ones."""
         c = self.config
         encoder = encoder_modules[c['encoder']]() if c['encoder'] is not None else None
         module = ensemblize(ARCritic, c['num_qs'], in_axes=(None, None, 0))(
             hidden_dims=c['value_hidden_dims'], base=c['arb_base'], length=c['arb_length'],
             d_model=c['arb_d_model'], num_layers=c['arb_num_layers'], num_heads=c['arb_num_heads'],
-            layer_norm=c['layer_norm'], encoder=encoder,
+            layer_norm=c['layer_norm'], encoder=encoder, **self._vocab_kwargs(c),
         )
-        params = self.network.params['modules_target_critic' if target else 'modules_critic']
+        if params is None:
+            params = self.network.params['modules_target_critic' if target else 'modules_critic']
         return lambda o, a, d: module.apply({'params': params}, o, a, d)
 
+    @staticmethod
+    def _vocab_kwargs(config):
+        """ARCritic kwargs of the vocabulary (none for the ordinary one: module unchanged)."""
+        if (config['arb_vocab'] if 'arb_vocab' in config else 'ordinary') == 'redundant':
+            return dict(num_classes=geo_codes.NUM_CLASSES)
+        return {}
+
     def _sampled_codes(self, observations, actions, target, rng):
-        """sample_mean readout: M codes per copy, (n (num_qs, ..., M) int32 clipped to [0, B^L-1], oor bool)."""
+        """sample_mean readout: M codes per copy, (n (num_qs, ..., M) int32 clipped to [0, B^L-1], oor bool).
+
+        oor marks decoded values outside [0, B^L - 1] before the clip (only possible for the redundant vocabulary)."""
         B, L, M = self.config['arb_base'], self.config['arb_length'], self.config['arb_readout_samples']
+        num_classes = geo_codes.NUM_CLASSES if self._redundant() else B
         batch_shape = actions.shape[:-1]
-        gumbel = jax.random.gumbel(rng, (self.config['num_qs'], *batch_shape, M, L, B))
+        gumbel = jax.random.gumbel(rng, (self.config['num_qs'], *batch_shape, M, L, num_classes))
         digits = ar_sample_codes(self._percopy_critic(target), observations, actions, gumbel,
                                  self._cfg('arb_readout_temp', 1.0))
-        n = ar_code(digits, B)
+        n = self._decode(digits)
         oor = (n < 0) | (n > B ** L - 1)  # never for ordinary tokens
         return jnp.clip(n, 0, B ** L - 1), oor
 
@@ -278,6 +335,82 @@ class ACARBAgent(flax.struct.PyTreeNode):
         # u = 1 is not representable in [0, 1); clip to the largest code.
         return target_q, jnp.clip(u, 0.0, 1.0 - B ** -L), info
 
+    def critic_ce(self, observations, actions, target_q, target_k, grad_params, rollin_rng, w):
+        """Teacher-forced cross-entropy of the configured labels: (ce (num_qs, batch, L), logits, labels, info).
+
+        labels are class indices broadcastable to (num_qs, batch, L) for the accuracy diagnostics; info holds
+        label statistics (w: row weights, only used for those). target_q: clipped target value (batch,);
+        target_k: its int32 grid numerator (sample_mean readout only); rollin_rng: the roll-in key."""
+        B, L = self.config['arb_base'], self.config['arb_length']
+        label_mode = self._cfg('arb_label', 'hard')
+        if label_mode in geo_codes.LABEL_MODES:
+            return self._geo_ce(observations, actions, target_k, grad_params, rollin_rng, w)
+        info = {}
+        if label_mode == 'hard':
+            labels = ar_bin(target_q, B, L)  # (batch, L)
+        else:
+            labels, label_q, label_clip = ar_label_dists(target_k, self.readout_den(), B, L, label_mode)
+
+        # Positional args only: nn.vmap (ensemblize) silently drops kwargs.
+        logits = self.network.select('critic')(
+            observations, actions, labels, params=grad_params
+        )  # (num_qs, batch, L, B)
+        if label_mode == 'hard':
+            ce = optax.softmax_cross_entropy_with_integer_labels(logits, labels[None])  # (num_qs, batch, L)
+        else:
+            ce = soft_cross_entropy(logits, label_q[None])  # (num_qs, batch, L)
+            for l in range(L):
+                info[f'label_clip_pos{l + 1}'] = label_clip[..., l].astype(jnp.float32).mean()
+        if target_k is not None and label_mode == 'hard':
+            for l in range(L):
+                info[f'label_clip_pos{l + 1}'] = jnp.zeros((), jnp.float32)
+        return ce, logits, labels[None], info
+
+    def _geo_ce(self, observations, actions, target_k, grad_params, rollin_rng, w):
+        """Redundant vocabulary (E5-E9): one geo_codes.build prefix path per element and per copy.
+
+        k is broadcast to (num_qs, batch); each copy is teacher-forced on its own roll-in classes with
+        grad_params. E6 (model_mix): the model token at a position is ONE sample at arb_readout_temp from the
+        current copy (stop-gradient params) given that copy's actual prefix, with noise
+        fold_in(model_rng, position). model_rng = split(rollin_rng, 4)[3]: build uses split(rollin_rng, 3)
+        (with partitionable threefry split(k, n)[i] does not depend on n, so index 3 is disjoint from it)."""
+        num_qs = self.config['num_qs']
+        k = jnp.broadcast_to(target_k, (num_qs, *target_k.shape))
+        sg = jax.lax.stop_gradient
+        to_classes = lambda t: jnp.clip(geo_codes.token_to_class(t), 0, geo_codes.NUM_CLASSES - 1)
+        model_token = None
+        if self._cfg('arb_rollin', 'canonical') == 'model_mix':
+            model_rng = jax.random.split(rollin_rng, 4)[3]
+            current = self._percopy_critic(False, params=sg(grad_params['modules_critic']))
+            temp = self._cfg('arb_readout_temp', 1.0)
+
+            def model_token(prefix_tokens, position):
+                logits = sg(current(observations, actions, to_classes(prefix_tokens)))[..., position, :]
+                gumbel = jax.random.gumbel(jax.random.fold_in(model_rng, position), logits.shape)
+                return geo_codes.class_to_token(jnp.argmax(logits / temp + gumbel, axis=-1).astype(jnp.int32))
+
+        q, rollin, binfo = geo_codes.build(k, self.config['arb_label'], self.config['arb_rollin'], rollin_rng,
+                                           model_token, k_den=self.readout_den())
+        q, rollin = sg(q), sg(rollin)
+        logits = self._percopy_critic(False, params=grad_params['modules_critic'])(
+            observations, actions, to_classes(rollin))  # (num_qs, batch, L, 54)
+        ce = soft_cross_entropy(logits, q)  # (num_qs, batch, L)
+
+        # Label bias: prefix value of the roll-ins + w_3 E_{q_3}[token] - u, in units of 0.001 then scaled.
+        tokens = geo_codes.class_to_token(jnp.arange(geo_codes.NUM_CLASSES)).astype(jnp.float32)
+        last = (q[..., -1, :] * tokens).sum(-1)
+        prefix = geo_codes.decode_units(rollin.at[..., -1].set(0)).astype(jnp.float32)
+        bias = (prefix + last - k.astype(jnp.float32) / (self.readout_den() // 1000)) / 1000
+        n_model = num_qs * target_k.shape[0] * geo_codes.ROLLIN_POSITIONS
+        info = {
+            'oov_label': binfo['oov_label'].astype(jnp.float32),
+            'oov_rollin': binfo['oov_rollin'].astype(jnp.float32),
+            'model_used_frac': binfo['model_used'].astype(jnp.float32) / n_model,
+            'model_clamp_frac': binfo['model_clamp'].astype(jnp.float32) / jnp.maximum(binfo['model_used'], 1),
+            'label_mean_bias': _wmean(bias, jnp.broadcast_to(w, bias.shape)),
+        }
+        return ce, logits, jnp.argmax(q, axis=-1), info
+
     def critic_loss(self, batch, grad_params, rng):
         """Compute the ACARB critic loss."""
         B, L = self.config['arb_base'], self.config['arb_length']
@@ -287,39 +420,26 @@ class ACARBAgent(flax.struct.PyTreeNode):
         else:
             batch_actions = batch["actions"][..., 0, :]
 
-        # Keys: TD next-action noise, target readout (training code stream), training roll-in (the 4th key,
-        # once used by the readout diagnostics; unused while the roll-in is the canonical digits).
+        # Keys: TD next-action noise, target readout (training code stream), training roll-in (the 4th key:
+        # unused while the roll-in is the canonical digits; the geo2b roll-ins of the redundant vocabulary).
         rng, sample_rng, readout_rng, rollin_rng = jax.random.split(rng, 4)
-        del rollin_rng
         raw_target, target_q, target_info = self.td_target(batch, sample_rng, readout_rng)
         target_k = target_info.pop('target_k', None)  # int32 grid numerator (sample_mean readout only)
-        label_mode = self._cfg('arb_label', 'hard')
-        if label_mode == 'hard':
-            labels = ar_bin(target_q, B, L)  # (batch, L)
-        else:
-            labels, label_q, label_clip = ar_label_dists(target_k, self.readout_den(), B, L, label_mode)
-
-        # Positional args only: nn.vmap (ensemblize) silently drops kwargs.
-        logits = self.network.select('critic')(
-            batch['observations'], batch_actions, labels, params=grad_params
-        )  # (num_qs, batch, L, B)
-        if label_mode == 'hard':
-            ce = optax.softmax_cross_entropy_with_integer_labels(logits, labels[None])  # (num_qs, batch, L)
-        else:
-            ce = soft_cross_entropy(logits, label_q[None])  # (num_qs, batch, L)
-            for l in range(L):
-                target_info[f'label_clip_pos{l + 1}'] = label_clip[..., l].astype(jnp.float32).mean()
-        if target_k is not None and label_mode == 'hard':
-            for l in range(L):
-                target_info[f'label_clip_pos{l + 1}'] = jnp.zeros((), jnp.float32)
         w = batch['valid'][..., -1]
+        ce, logits, labels, label_info = self.critic_ce(
+            batch['observations'], batch_actions, target_q, target_k, grad_params, rollin_rng, w)
+        target_info.update(label_info)
         critic_loss = (ce.mean(axis=(0, 2)) * w).mean()
 
-        # Diagnostics: teacher-forced vs greedy digits, and how errors propagate from digit 1.
-        tf_correct = jnp.argmax(logits, axis=-1) == labels[None]
+        # Diagnostics: teacher-forced vs greedy digits, and how errors propagate from digit 1. labels: class
+        # indices broadcastable to (num_qs, batch, L) (redundant vocabulary: the argmax of each copy's labels).
+        tf_correct = jnp.argmax(logits, axis=-1) == labels
         greedy = jax.lax.stop_gradient(self.network.select('critic')(batch['observations'], batch_actions))
-        greedy_q = ar_decode(greedy, B)
-        greedy_correct = greedy == labels[None]
+        if self._redundant():
+            greedy_q = jnp.clip(self._decode(greedy), 0, B ** L - 1).astype(jnp.float32) / B ** L
+        else:
+            greedy_q = ar_decode(greedy, B)
+        greedy_correct = greedy == labels
         abs_err = jnp.abs(greedy_q - target_q[None])
         first_wrong = ~greedy_correct[..., 0]
         wb = jnp.broadcast_to(w, abs_err.shape)
@@ -361,6 +481,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
         observations = batch['observations']
         greedy_q = self.critic_value(observations, actions, readout='greedy')
         wb = jnp.broadcast_to(batch['valid'][..., -1], greedy_q.shape)
+        if self._redundant():
+            return self._redundant_readout_diagnostics(observations, actions, greedy_q, wb, batch, rng)
         expected_q = sg(self.critic_value(observations, actions, readout='expected'))
         digit1_p = jax.nn.softmax(sg(self.network.select('critic')(
             observations, actions, jnp.zeros((*actions.shape[:-1], L), jnp.int32)))[..., 0, :], axis=-1)
@@ -385,6 +507,28 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'bon_greedy_spread': spread(cand_greedy),
             'bon_expected_spread': spread(cand_expected),
             'bon_greedy_expected_gap': jnp.abs(cand_greedy - cand_expected).mean(),
+            'q_readout': _wmean(q_readout, batch['valid'][..., -1]),
+        }
+        return {f'critic/{k}': v for k, v in info.items()}
+
+    def _redundant_readout_diagnostics(self, observations, actions, greedy_q, wb, batch, rng):
+        """readout_diagnostics for the redundant vocabulary: greedy (decoded tokens, final value clipped) and the
+        run's readout; no exact expectation (54^2 prefixes per element)."""
+        sg = jax.lax.stop_gradient
+        L = self.config['arb_length']
+        greedy_n = self._decode(self.network.select('critic')(observations, actions))
+        digit1_p = jax.nn.softmax(sg(self.network.select('critic')(
+            observations, actions, jnp.zeros((*actions.shape[:-1], L), jnp.int32)))[..., 0, :], axis=-1)
+        obs, cands = self._candidates(observations[:self.config['arb_diag_obs']], rng)
+        cand_greedy = self._agg(sg(self.critic_value(obs, cands, readout='greedy')))  # (n_obs, N)
+        top = cand_greedy.max(-1, keepdims=True)
+        q_readout = sg(self.readout_q(observations, actions, jax.random.fold_in(rng, 1)))
+        info = {
+            'greedy_q': _wmean(greedy_q, wb),
+            'greedy_oor_frac': _wmean((greedy_n < 0) | (greedy_n > 10 ** L - 1), wb),
+            'digit1_maxprob': _wmean(digit1_p.max(-1), wb),
+            'bon_tie_frac': ((cand_greedy == top).sum(-1) > 1).mean(),
+            'bon_greedy_spread': (cand_greedy.max(-1) - cand_greedy.min(-1)).mean(),
             'q_readout': _wmean(q_readout, batch['valid'][..., -1]),
         }
         return {f'critic/{k}': v for k, v in info.items()}
@@ -598,7 +742,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
             assert not config['use_mc_target'], 'use_mc_target is a BSC-only option'
         assert config['arb_readout'] in ('greedy', 'sample', 'expected', 'sample_mean'), config['arb_readout']
         label = config['arb_label'] if 'arb_label' in config else 'hard'
-        assert label in ('hard', 'twohot_last', 'twohot_last2', 'twohot_all'), label
+        geo_errors = geo_config_errors(config)
+        assert not geo_errors, '; '.join(geo_errors)
         if config['arb_readout'] == 'sample_mean':
             assert config['q_agg'] == 'mean', 'arb_readout=sample_mean needs q_agg=mean'
             k_den = config['arb_base'] ** config['arb_length'] * config['num_qs'] * config['arb_readout_samples']
@@ -635,6 +780,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
             num_heads=config['arb_num_heads'],
             layer_norm=config['layer_norm'],
             encoder=encoders.get('critic'),
+            **cls._vocab_kwargs(config),
         )
 
         actor_bc_flow_def = ActorVectorField(
@@ -711,7 +857,11 @@ def get_config():
                                    # 'sample_mean' (per-copy sampled codes at arb_readout_temp, integer ensemble score S).
             arb_readout_samples=32,  # Codes averaged per (s, a) (and per copy for sample_mean) when arb_readout='sample'/'sample_mean'.
             arb_readout_temp=1.0,  # sample_mean: softmax temperature of the sampled digits.
-            arb_label='hard',  # 'hard' (one-hot digits) or 'twohot_last' / 'twohot_last2' / 'twohot_all' (needs sample_mean).
+            arb_label='hard',  # 'hard' (one-hot digits) or 'twohot_last' / 'twohot_last2' / 'twohot_all' (needs sample_mean);
+                               # redundant vocabulary: 'corrective' / 'noisy_fixed' / 'noisy_resid' (agents/geo_codes.py).
+            arb_vocab='ordinary',  # 'ordinary' (tokens 0..9) or 'redundant' (signed tokens -22..31, 54 classes).
+            arb_rollin='canonical',  # Teacher-forcing prefix: 'canonical' digits, or (redundant) 'corrective' /
+                                     # 'model_mix' / 'fixed' (allowed pairs with arb_label: GEO_COMBOS).
             arb_diag_obs=32,  # Observations used for the best-of-n readout diagnostics.
             arb_value='bsc',  # 'bsc': digits encode P(success); 'qc': digits encode (q + 100) / 100 of the raw QC value.
         )

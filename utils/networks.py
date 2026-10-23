@@ -261,6 +261,8 @@ class ARCritic(nn.Module):
 
     Token 0 is the (s, a) embedding from an MLP trunk; tokens 1..L-1 are the prefix digits.
     The output at position l gives logits for digit l+1.
+    num_classes (default: base) sets the size of the token embedding and output head only (e.g. 54 for
+    the redundant signed vocabulary of agents/geo_codes.py); digits in and out are class indices.
     """
 
     hidden_dims: Sequence[int]
@@ -271,14 +273,16 @@ class ARCritic(nn.Module):
     num_heads: int = 4
     layer_norm: bool = True
     encoder: nn.Module = None
+    num_classes: Optional[int] = None
 
     def setup(self):
+        num_classes = self.num_classes or self.base
         self.trunk = MLP((*self.hidden_dims, self.d_model), activate_final=False, layer_norm=self.layer_norm)
-        self.digit_embed = nn.Embed(self.base, self.d_model)
+        self.digit_embed = nn.Embed(num_classes, self.d_model)
         self.pos_embed = self.param('pos_embed', nn.initializers.normal(0.02), (self.length, self.d_model))
         self.blocks = [CausalBlock(self.d_model, self.num_heads) for _ in range(self.num_layers)]
         self.out_ln = nn.LayerNorm()
-        self.head = nn.Dense(self.base, kernel_init=default_init())
+        self.head = nn.Dense(num_classes, kernel_init=default_init())
 
     def _logits(self, h, digits):
         tokens = jnp.concatenate([h[..., None, :], self.digit_embed(digits[..., :-1])], axis=-2)

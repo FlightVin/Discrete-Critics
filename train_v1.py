@@ -63,6 +63,7 @@ from ml_collections import config_flags
 from scipy.stats import spearmanr
 
 from agents import V1_METHODS, agents, v1_config
+from agents.acarb import geo_config_errors
 from envs.env_utils import make_env_and_datasets, make_vectorized_eval_envs
 from envs.robomimic_utils import get_max_episode_length, is_robomimic_env
 from evaluation import evaluate_parallel
@@ -142,7 +143,8 @@ RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name',
 LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'replay_rng': 'global',
                        'src_run_dir': None, 'out': None}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
-LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard'}
+LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
+                        'arb_rollin': 'canonical'}
 REPLAY_SEED_OFFSET = 1_000_003
 EXIT_PREEMPTED = 143
 ONLINE_PHASES = ['warmup', 'pretrain', 'pretrain_eval', 'joint', 'done']
@@ -314,6 +316,7 @@ def check_agent_config(mode, config):
         if label != 'hard' and (config['arb_value'] != 'bsc' or readout != 'sample_mean'):
             errors.append(f"arb_label={label} needs arb_value=bsc and arb_readout=sample_mean "
                           f"(got {config['arb_value']}, {readout})")
+        errors.extend(geo_config_errors(config))
     if errors:
         print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
         sys.exit(2)
