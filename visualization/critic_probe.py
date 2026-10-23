@@ -65,6 +65,84 @@ def probe_batch(agent, obs, data_actions, cand_noises, rand_actions, rng):
     return q_data, q_cand, q_rand
 
 
+def uses_integer_score(agent):
+    return agent.config['agent_name'] == 'acarb' and agent.config['arb_readout'] == 'sample_mean'
+
+
+def ensemble_score(agent, observations, actions, rng):
+    """(score, value, oor_frac) of the final ensemble readout, shape (...).
+
+    score is what best-of-n ranks by: the integer S for acarb's sample_mean readout (value S / K_den),
+    else the aggregated q_values (score == value). oor_frac: decoded codes outside [0, B^L - 1] (sample_mean
+    only, else 0). Ties are exact equality of score."""
+    if uses_integer_score(agent):
+        s, oor = agent.critic_score(observations, actions, rng=rng)
+        return s, s.astype(jnp.float32) / agent.readout_den(), oor
+    q = q_values(agent, observations, actions, rng)
+    return q, q, jnp.zeros_like(q)
+
+
+@jax.jit
+def probe_batch_scores(agent, obs, data_actions, cand_noises, rand_actions, rng):
+    """probe_batch with the readout's final ensemble score of the candidates: (q_data, q_cand, q_rand, s_cand)."""
+    n = agent.config['actor_num_samples']
+    q_data = ensemble_score(agent, obs, data_actions, rng)[1]
+    obs_rep = jnp.repeat(obs[:, None, :], n, axis=1)
+    cand = agent.compute_flow_actions(obs_rep, cand_noises)
+    s_cand, q_cand, _ = ensemble_score(agent, obs_rep, cand, rng)
+    q_rand = ensemble_score(agent, obs, rand_actions, rng)[1]
+    return q_data, q_cand, q_rand, s_cand
+
+
+@jax.jit
+def fixed_scores(agent, obs, cands, rng):
+    """ensemble_score of fixed candidates cands (n, N, adim) at states obs (n, obs_dim)."""
+    obs_rep = jnp.repeat(obs[:, None, :], cands.shape[1], axis=1)
+    return ensemble_score(agent, obs_rep, cands, rng)
+
+
+def tie_stats(s):
+    """(tie_all, tie_max) of scores (n, N): all N equal / >= 2 candidates share the maximum."""
+    s = np.asarray(s)
+    top = s.max(1, keepdims=True)
+    return float((s.max(1) == s.min(1)).mean()), float(((s == top).sum(1) >= 2).mean())
+
+
+STAB_SEED, STAB_REPEATS, STAB_STRIDE = 20261022, 5, 8
+
+
+def probe_fixed(agent, obs, cands, batch=256):
+    """Probe on fixed candidates (shared across runs): probe_fixed/* and probe_stab/* metrics.
+
+    Main pass with key PRNGKey(0) (as the current-actor probe). Stability: states 0, 8, 16, ... scored
+    STAB_REPEATS times with keys fold_in(PRNGKey(STAB_SEED), rep), rep = 0..4; per-candidate variance of
+    the ensemble value across repeats (averaged), and the fraction of (state, repeat >= 1) whose first-index
+    argmax of the score equals repeat 0's. Uses only these probe keys (no training RNG)."""
+    parts = [fixed_scores(agent, obs[s:s + batch], cands[s:s + batch], jax.random.PRNGKey(0))
+             for s in range(0, len(obs), batch)]
+    score, value, oor = (np.concatenate([np.asarray(p[k]) for p in parts]) for k in range(3))
+    tie_all, tie_max = tie_stats(score)
+    out = {'probe_fixed/tie_all': tie_all, 'probe_fixed/tie_max': tie_max,
+           'probe_fixed/score_mean': float(value.mean()),
+           'probe_fixed/cand_range_mean': float((value.max(1) - value.min(1)).mean()),
+           'probe_fixed/oor_frac': float(oor.mean())}
+    sub = np.arange(0, len(obs), STAB_STRIDE)
+    reps = [fixed_scores(agent, obs[sub], cands[sub], jax.random.fold_in(jax.random.PRNGKey(STAB_SEED), r))
+            for r in range(STAB_REPEATS)]
+    values = np.stack([np.asarray(r[1]) for r in reps])           # (reps, n_sub, N)
+    argmax = np.stack([np.asarray(r[0]).argmax(-1) for r in reps])  # (reps, n_sub), first index on ties
+    out['probe_stab/score_var_mean'] = float(values.astype(np.float64).var(0).mean())
+    out['probe_stab/same_argmax_frac'] = float((argmax[1:] == argmax[0]).mean())
+    return out
+
+
+def make_candidates(agent, obs, noises, batch=256):
+    """The agent's BC flow actions for fixed noises (n, N, adim) at states obs (n, obs_dim), as probe_batch."""
+    f = jax.jit(lambda a, o, z: a.compute_flow_actions(jnp.repeat(o[:, None, :], z.shape[1], axis=1), z))
+    return np.concatenate([np.asarray(f(agent, obs[s:s + batch], noises[s:s + batch]))
+                           for s in range(0, len(obs), batch)])
+
+
 def probe_states(ds, horizon, num_states, seed):
     """Fixed chunk start indices that stay inside one trajectory, and steps left in that demo."""
     terminals = np.asarray(ds['terminals']) > 0

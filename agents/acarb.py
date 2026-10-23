@@ -33,6 +33,72 @@ def ar_decode(digits, base):
     return (digits * scales).sum(axis=-1)
 
 
+def ar_code(digits, base):
+    """Integer code sum_l z_l B^(L-l) of digit sequences (..., L) (int32)."""
+    L = digits.shape[-1]
+    powers = base ** jnp.arange(L - 1, -1, -1, dtype=jnp.int32)
+    return (digits.astype(jnp.int32) * powers).sum(-1)
+
+
+def ar_sample_codes(critic_fn, observations, actions, gumbel, temp):
+    """Sample codes autoregressively with per-copy noise: z_l ~ Categorical(softmax(logits_l / temp)).
+
+    critic_fn maps (observations, actions, digits (num_qs, ..., M, L)) to teacher-forced logits
+    (num_qs, ..., M, L, B), each copy reading its own digits (see ACARBAgent._percopy_critic).
+    gumbel: standard Gumbel noise (num_qs, ..., M, L, B), one draw per copy, sample, element and
+    position; argmax(logits / temp + gumbel) is an exact categorical sample. Each sequence's digit l
+    is conditioned on its own sampled prefix (L teacher-forced passes). Returns digits (num_qs, ..., M, L).
+    """
+    L = gumbel.shape[-2]
+    digits = jnp.zeros(gumbel.shape[:-1], dtype=jnp.int32)
+    for l in range(L):
+        logits = critic_fn(observations, actions, digits)[..., l, :]
+        digits = digits.at[..., l].set(jnp.argmax(logits / temp + gumbel[..., l, :], axis=-1).astype(jnp.int32))
+    return digits
+
+
+def ar_label_dists(k, k_den, base, length, mode):
+    """Exact digit labels for targets on the grid u = k / k_den (k int32).
+
+    Returns (d, q, clip): d (..., L) canonical digits ar_bin(u) (the roll-in), q (..., L, B) label
+    distributions and clip (..., L) whether the position's residual was clamped to [0, B-1].
+    Positions before `first soft` are one-hot d_l; the others are two-hot T(r_l) with
+    r_l = (u - v_prefix) / w_l, v_prefix = dec(d_1..d_{l-1}), w_l = B^-l, computed in integers:
+    r_l = (k B^l - B P_l k_den) / k_den with P_l the integer prefix code, floor by integer floor
+    division (toward -inf), f = remainder / k_den (f = 0 exactly for exact codes, then one class).
+    """
+    first_soft = {'hard': length, 'twohot_last': length - 1, 'twohot_last2': length - 2, 'twohot_all': 0}[mode]
+    k = jnp.asarray(k, jnp.int32)
+    d = ar_bin(k.astype(jnp.float32) / k_den, base, length)
+    qs, clips = [], []
+    for l in range(length):
+        onehot = jax.nn.one_hot(d[..., l], base)
+        if l < first_soft:
+            qs.append(onehot)
+            clips.append(jnp.zeros(k.shape, bool))
+            continue
+        prefix = ar_code(d[..., :l], base) if l > 0 else jnp.zeros_like(k)
+        num = k * base ** (l + 1) - prefix * base * k_den
+        a = num // k_den
+        rem = num - a * k_den  # in [0, k_den)
+        low = num < 0
+        high = (a > base - 1) | ((a == base - 1) & (rem > 0))
+        clip = low | high
+        a = jnp.clip(a, 0, base - 1)
+        f = jnp.where(clip, 0.0, rem.astype(jnp.float32) / k_den)
+        lo = jax.nn.one_hot(a, base)
+        hi = jax.nn.one_hot(jnp.minimum(a + 1, base - 1), base)
+        q = jnp.where((f > 0)[..., None], (1.0 - f)[..., None] * lo + f[..., None] * hi, lo)
+        qs.append(q)
+        clips.append(clip)
+    return d, jnp.stack(qs, axis=-2), jnp.stack(clips, axis=-1)
+
+
+def soft_cross_entropy(logits, q):
+    """-sum_t q(t) log softmax(logits)(t) (temperature 1); q is stop-gradient."""
+    return -(jax.lax.stop_gradient(q) * jax.nn.log_softmax(logits, axis=-1)).sum(-1)
+
+
 def ar_expected(critic_fn, observations, actions, base, length):
     """Exact E[dec(z)] under the AR digit distribution.
 
@@ -93,7 +159,50 @@ class ACARBAgent(flax.struct.PyTreeNode):
             return ar_decode(critic_fn(observations, actions, None, keys), B).mean(-1)
         if readout == 'expected':
             return ar_expected(critic_fn, observations, actions, B, L)
+        if readout == 'sample_mean':
+            n, _ = self._sampled_codes(observations, actions, target, rng)
+            return n.sum(-1) / (B ** L * self.config['arb_readout_samples'])
         raise ValueError(f'unknown arb_readout {readout}')
+
+    def _cfg(self, key, default):
+        return self.config[key] if key in self.config else default
+
+    def readout_den(self):
+        """K_den = B^L * num_qs * M: the sample_mean ensemble value is S / K_den."""
+        return self.config['arb_base'] ** self.config['arb_length'] * self.config['num_qs'] * \
+            self.config['arb_readout_samples']
+
+    def _percopy_critic(self, target):
+        """Teacher-forced critic whose digits argument has a leading num_qs axis (one prefix per copy).
+
+        Same module and parameters as the 'critic' / 'target_critic' ensemble (nn.vmap over the same
+        params); only the digits are mapped over the copies instead of broadcast."""
+        c = self.config
+        encoder = encoder_modules[c['encoder']]() if c['encoder'] is not None else None
+        module = ensemblize(ARCritic, c['num_qs'], in_axes=(None, None, 0))(
+            hidden_dims=c['value_hidden_dims'], base=c['arb_base'], length=c['arb_length'],
+            d_model=c['arb_d_model'], num_layers=c['arb_num_layers'], num_heads=c['arb_num_heads'],
+            layer_norm=c['layer_norm'], encoder=encoder,
+        )
+        params = self.network.params['modules_target_critic' if target else 'modules_critic']
+        return lambda o, a, d: module.apply({'params': params}, o, a, d)
+
+    def _sampled_codes(self, observations, actions, target, rng):
+        """sample_mean readout: M codes per copy, (n (num_qs, ..., M) int32 clipped to [0, B^L-1], oor bool)."""
+        B, L, M = self.config['arb_base'], self.config['arb_length'], self.config['arb_readout_samples']
+        batch_shape = actions.shape[:-1]
+        gumbel = jax.random.gumbel(rng, (self.config['num_qs'], *batch_shape, M, L, B))
+        digits = ar_sample_codes(self._percopy_critic(target), observations, actions, gumbel,
+                                 self._cfg('arb_readout_temp', 1.0))
+        n = ar_code(digits, B)
+        oor = (n < 0) | (n > B ** L - 1)  # never for ordinary tokens
+        return jnp.clip(n, 0, B ** L - 1), oor
+
+    def critic_score(self, observations, actions, target=False, rng=None):
+        """sample_mean: integer ensemble score S = sum over copies and samples of the codes (int32), and the
+        fraction of decoded codes outside [0, B^L - 1] before the clip, both of shape (...)."""
+        n, oor = self._sampled_codes(observations, actions, target, rng)
+        return n.sum(axis=(0, -1)), oor.astype(jnp.float32).mean(axis=(0, -1))
 
     def td_target(self, batch, sample_rng, readout_rng):
         """TD target as (y, u, info): y in value units (P(success) or raw QC), u = clipped digit fraction."""
@@ -109,7 +218,12 @@ class ACARBAgent(flax.struct.PyTreeNode):
             next_actions = self.compute_flow_actions(next_obs, noises)
             next_actions = jnp.clip(next_actions, -1, 1)
 
-        next_qs = self.critic_value(next_obs, next_actions, target=True, rng=readout_rng)  # digit fractions
+        sample_mean = self.config['arb_readout'] == 'sample_mean'
+        if sample_mean:
+            # Integer ensemble score of the target critic; the value is S / K_den (q_agg = mean).
+            next_s, oor = self.critic_score(next_obs, next_actions, target=True, rng=readout_rng)
+        else:
+            next_qs = self.critic_value(next_obs, next_actions, target=True, rng=readout_rng)  # digit fractions
 
         # Same terminal handling as ACBSC.
         bsc_is_terminal = batch['terminals'][..., -1] > 0.5
@@ -119,6 +233,29 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'success_frac': bsc_is_success.astype(jnp.float32).mean(),
             'timeout_frac': (bsc_is_terminal & ~bsc_is_success).astype(jnp.float32).mean(),
         }
+        if sample_mean:
+            # Exact grid: every target is u = k / K_den, k int32 (success: k = K_den (1 - B^-L); timeout: 0;
+            # non-terminal: S of the target readout, discount 1).
+            assert self.config['arb_value'] == 'bsc'
+            k_den = self.readout_den()
+            k_top = k_den - k_den // B ** L
+            next_q = next_s.astype(jnp.float32) / k_den
+            if self.config['use_mc_target']:
+                target_q = trajectory_success.astype(jnp.float32)
+                k = jnp.where(trajectory_success, k_top, 0)
+            else:
+                assert self.config['discount'] == 1.0, 'sample_mean targets need discount 1 (integer grid)'
+                target_q = (
+                    (bsc_is_terminal & bsc_is_success).astype(jnp.float32) * 1.0
+                    + (~bsc_is_terminal).astype(jnp.float32) * next_q
+                )
+                k = jnp.where(bsc_is_terminal, jnp.where(bsc_is_success, k_den, 0), next_s)
+            info['target_clip_frac'] = (k > k_top).astype(jnp.float32).mean()
+            info['readout_oor_frac'] = oor.mean()
+            info['target_k'] = jnp.minimum(k, k_top).astype(jnp.int32)  # popped by critic_loss
+            u = jnp.clip(target_q, 0.0, 1.0 - B ** -L)
+            info['target_u_mean'] = u.mean()
+            return target_q, u, info
 
         if self.config['arb_value'] == 'qc':
             # Bellman backup in raw QC units, exactly as ACFQL: y = R + gamma^H * M * qbar(s', a').
@@ -150,16 +287,31 @@ class ACARBAgent(flax.struct.PyTreeNode):
         else:
             batch_actions = batch["actions"][..., 0, :]
 
-        # The 4th key used to feed the readout diagnostics; kept so the key stream is unchanged.
-        rng, sample_rng, readout_rng, _ = jax.random.split(rng, 4)
+        # Keys: TD next-action noise, target readout (training code stream), training roll-in (the 4th key,
+        # once used by the readout diagnostics; unused while the roll-in is the canonical digits).
+        rng, sample_rng, readout_rng, rollin_rng = jax.random.split(rng, 4)
+        del rollin_rng
         raw_target, target_q, target_info = self.td_target(batch, sample_rng, readout_rng)
-        labels = ar_bin(target_q, B, L)  # (batch, L)
+        target_k = target_info.pop('target_k', None)  # int32 grid numerator (sample_mean readout only)
+        label_mode = self._cfg('arb_label', 'hard')
+        if label_mode == 'hard':
+            labels = ar_bin(target_q, B, L)  # (batch, L)
+        else:
+            labels, label_q, label_clip = ar_label_dists(target_k, self.readout_den(), B, L, label_mode)
 
         # Positional args only: nn.vmap (ensemblize) silently drops kwargs.
         logits = self.network.select('critic')(
             batch['observations'], batch_actions, labels, params=grad_params
         )  # (num_qs, batch, L, B)
-        ce = optax.softmax_cross_entropy_with_integer_labels(logits, labels[None])  # (num_qs, batch, L)
+        if label_mode == 'hard':
+            ce = optax.softmax_cross_entropy_with_integer_labels(logits, labels[None])  # (num_qs, batch, L)
+        else:
+            ce = soft_cross_entropy(logits, label_q[None])  # (num_qs, batch, L)
+            for l in range(L):
+                target_info[f'label_clip_pos{l + 1}'] = label_clip[..., l].astype(jnp.float32).mean()
+        if target_k is not None and label_mode == 'hard':
+            for l in range(L):
+                target_info[f'label_clip_pos{l + 1}'] = jnp.zeros((), jnp.float32)
         w = batch['valid'][..., -1]
         critic_loss = (ce.mean(axis=(0, 2)) * w).mean()
 
@@ -219,6 +371,9 @@ class ACARBAgent(flax.struct.PyTreeNode):
         cand_expected = self._agg(sg(self.critic_value(obs, cands, readout='expected')))
         top = cand_greedy.max(-1, keepdims=True)
         spread = lambda q: (q.max(-1) - q.min(-1)).mean()
+        # The run's own readout on the batch (s, a), with a key derived from the diagnostics stream (the
+        # candidates above keep `rng` itself).
+        q_readout = sg(self.readout_q(observations, actions, jax.random.fold_in(rng, 1)))
 
         info = {
             'expected_q': _wmean(expected_q, wb),
@@ -230,6 +385,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'bon_greedy_spread': spread(cand_greedy),
             'bon_expected_spread': spread(cand_expected),
             'bon_greedy_expected_gap': jnp.abs(cand_greedy - cand_expected).mean(),
+            'q_readout': _wmean(q_readout, batch['valid'][..., -1]),
         }
         return {f'critic/{k}': v for k, v in info.items()}
 
@@ -359,7 +515,10 @@ class ACARBAgent(flax.struct.PyTreeNode):
                      (self.config['horizon_length'] if self.config["action_chunking"] else 1)
         rng, readout_rng = jax.random.split(rng)
         observations, actions = self._candidates(observations, rng)
-        q = self._agg(self.critic_value(observations, actions, rng=readout_rng))
+        if self.config['arb_readout'] == 'sample_mean':
+            q, _ = self.critic_score(observations, actions, rng=readout_rng)  # integer S; first index on ties
+        else:
+            q = self._agg(self.critic_value(observations, actions, rng=readout_rng))
         indices = jnp.argmax(q, axis=-1)
 
         bshape = indices.shape
@@ -385,6 +544,12 @@ class ACARBAgent(flax.struct.PyTreeNode):
         observations = jnp.repeat(observations[..., None, :], self.config["actor_num_samples"], axis=-2)
         actions = jnp.clip(self.compute_flow_actions(observations, noises), -1, 1)
         return observations, actions
+
+    def readout_q(self, observations, actions, rng):
+        """Ensemble value under the configured readout: S / K_den for sample_mean, else _agg(critic_value)."""
+        if self.config['arb_readout'] == 'sample_mean':
+            return self.critic_score(observations, actions, rng=rng)[0].astype(jnp.float32) / self.readout_den()
+        return self._agg(self.critic_value(observations, actions, rng=rng))
 
     def _agg(self, q_vals):
         return q_vals.mean(axis=0) if self.config["q_agg"] == "mean" else q_vals.min(axis=0)
@@ -431,6 +596,16 @@ class ACARBAgent(flax.struct.PyTreeNode):
             # Raw QC values span [-1/(1-gamma), 0] = [-QC_SCALE, 0] only for gamma = 0.99.
             assert abs(config['discount'] - (1 - 1 / QC_SCALE)) < 1e-9, 'arb_value=qc needs discount=0.99'
             assert not config['use_mc_target'], 'use_mc_target is a BSC-only option'
+        assert config['arb_readout'] in ('greedy', 'sample', 'expected', 'sample_mean'), config['arb_readout']
+        label = config['arb_label'] if 'arb_label' in config else 'hard'
+        assert label in ('hard', 'twohot_last', 'twohot_last2', 'twohot_all'), label
+        if config['arb_readout'] == 'sample_mean':
+            assert config['q_agg'] == 'mean', 'arb_readout=sample_mean needs q_agg=mean'
+            k_den = config['arb_base'] ** config['arb_length'] * config['num_qs'] * config['arb_readout_samples']
+            assert k_den * config['arb_base'] ** config['arb_length'] < 2 ** 31, 'int32 label arithmetic overflows'
+        if label != 'hard':
+            assert config['arb_value'] == 'bsc' and config['arb_readout'] == 'sample_mean', \
+                f'arb_label={label} needs arb_value=bsc and arb_readout=sample_mean (integer target grid)'
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -532,8 +707,11 @@ def get_config():
             arb_d_model=128,  # Transformer width.
             arb_num_layers=2,  # Transformer blocks.
             arb_num_heads=4,  # Attention heads.
-            arb_readout='greedy',  # Q readout for best-of-n and TD targets: 'greedy', 'sample' (mean of samples), 'expected' (exact).
-            arb_readout_samples=32,  # Codes averaged per (s, a) when arb_readout='sample'.
+            arb_readout='greedy',  # Q readout for best-of-n and TD targets: 'greedy', 'sample' (mean of samples), 'expected' (exact),
+                                   # 'sample_mean' (per-copy sampled codes at arb_readout_temp, integer ensemble score S).
+            arb_readout_samples=32,  # Codes averaged per (s, a) (and per copy for sample_mean) when arb_readout='sample'/'sample_mean'.
+            arb_readout_temp=1.0,  # sample_mean: softmax temperature of the sampled digits.
+            arb_label='hard',  # 'hard' (one-hot digits) or 'twohot_last' / 'twohot_last2' / 'twohot_all' (needs sample_mean).
             arb_diag_obs=32,  # Observations used for the best-of-n readout diagnostics.
             arb_value='bsc',  # 'bsc': digits encode P(success); 'qc': digits encode (q + 100) / 100 of the raw QC value.
         )

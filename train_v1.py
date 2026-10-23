@@ -8,6 +8,12 @@
                  state); at the end <run_dir>/selected_actor.pkl and selection.json are written.
   --mode=eval_actor  one n1 evaluation of --init_actor (agent, eval envs and seeding as in --mode=bc);
                  writes <run_dir>/eval_actor.json. No training, no checkpoints; W&B only with --project_name.
+  --mode=make_probe_candidates  --init_actor=<pkl> --out=<npz>: the actor's actions for the fixed probe noise
+                 at the fixed probe states (as the current-actor probe), shared by runs via --probe_candidates.
+  --mode=probe_ckpt  --src_run_dir=<run dir> --run_dir=<out dir> --probe_candidates=<npz> plus the source run's
+                 --method / --agent.* flags: restore only the agent from the source's committed checkpoint
+                 (read-only), run the current-actor and fixed-candidate probes with the run's readout, write
+                 <run_dir>/probe_ckpt.json. No env interaction, no training; W&B only with --project_name.
   --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
                  --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
                  fresh optimisers; then phases
@@ -35,6 +41,7 @@ episode is cut). Joint evaluations are due at multiples of --eval_interval onlin
 next episode boundary (a safe point), logged at the actual step with eval/nominal_step; the final
 evaluation runs when the online counter reaches --online_steps.
 """
+import hashlib
 import json
 import os
 import pickle
@@ -63,7 +70,8 @@ from log_utils import setup_wandb, get_flag_dict
 from utils.ckpt_v1 import CheckpointStore
 from utils.datasets import Dataset
 from utils.replay_v1 import FIELDS, SeqReplay
-from visualization.critic_probe import probe_batch, probe_states
+from visualization.critic_probe import (make_candidates, probe_batch, probe_batch_scores, probe_fixed, probe_states,
+                                       tie_stats, uses_integer_score)
 from visualization.eval_checkpoint import Policy
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -72,8 +80,10 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor'],
-                  'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor.')
+flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt'],
+                  'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
+                  'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
+                  'committed checkpoint of --src_run_dir (read-only).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -97,6 +107,12 @@ flags.DEFINE_integer('n_eval_envs', 32, 'Parallel eval envs.')
 flags.DEFINE_integer('eval_episodes', 2, 'Eval episodes per env and rule.')
 flags.DEFINE_integer('eval_seed', 1000, 'Eval env i is reseeded with eval_seed + i before every rule.')
 flags.DEFINE_integer('probe_states', 1024, 'Fixed demo states for the critic probe.')
+flags.DEFINE_string('probe_candidates', None, 'npz from --mode=make_probe_candidates: fixed candidate actions at the '
+                    'probe states, scored at every probe (probe_fixed/*, probe_stab/*). None: off.')
+flags.DEFINE_enum('replay_rng', 'global', ['global', 'separate'], 'Replay sampling RNG: numpy global state (global) '
+                  'or its own np.random.Generator(PCG64(seed + 1_000_003)), checkpointed (separate).')
+flags.DEFINE_string('src_run_dir', None, 'probe_ckpt: run directory whose committed checkpoint is probed (read-only).')
+flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
 flags.DEFINE_integer('log_interval', 5000, 'Log interval (updates / env steps).')
 flags.DEFINE_float('ckpt_minutes', 20.0, 'Periodic checkpoint interval (minutes) at safe points.')
 flags.DEFINE_float('preempt_budget_s', 60.0, 'After a preemption notice: if no safe point has been reached '
@@ -123,7 +139,11 @@ config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 # Flags that may change between restarts of the same run.
 RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval', 'preempt_budget_s'}
 # Flags added after runs were started: left out of args.json at their default (older run dirs still resume).
-LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0}
+LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'replay_rng': 'global',
+                       'src_run_dir': None, 'out': None}
+# Agent config keys added after runs were started: dropped from args.json / the config row at their default.
+LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard'}
+REPLAY_SEED_OFFSET = 1_000_003
 EXIT_PREEMPTED = 143
 ONLINE_PHASES = ['warmup', 'pretrain', 'pretrain_eval', 'joint', 'done']
 BC_PHASES = ['bc', 'done']
@@ -287,9 +307,22 @@ def check_agent_config(mode, config):
             errors.append('--method is required for --mode=online')
         if config['actor_num_samples'] != 32:
             errors.append(f"actor_num_samples={config['actor_num_samples']} (need 32)")
+    if config['agent_name'] == 'acarb':
+        readout, label = config['arb_readout'], config.get('arb_label', 'hard')
+        if readout == 'sample_mean' and config['q_agg'] != 'mean':
+            errors.append(f"arb_readout=sample_mean needs q_agg=mean (got {config['q_agg']})")
+        if label != 'hard' and (config['arb_value'] != 'bsc' or readout != 'sample_mean'):
+            errors.append(f"arb_label={label} needs arb_value=bsc and arb_readout=sample_mean "
+                          f"(got {config['arb_value']}, {readout})")
     if errors:
         print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
         sys.exit(2)
+
+
+def strip_later_agent_defaults(agent_dict):
+    """Agent config dict without the LATER_AGENT_DEFAULTS keys that are at their default."""
+    return {k: v for k, v in agent_dict.items()
+            if not (k in LATER_AGENT_DEFAULTS and v == LATER_AGENT_DEFAULTS[k])}
 
 
 def actor_params(agent):
@@ -324,6 +357,16 @@ def file_sha256(path):
     import hashlib
     with open(path, 'rb') as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+def load_probe_candidates(path, idx, shape):
+    """(candidate actions, info) from a make_probe_candidates npz, checked against the run's probe states."""
+    with np.load(path) as z:
+        cands, cidx, actions_sha = z['actions'], z['indices'], str(z['actions_sha256'])
+    assert np.array_equal(cidx, idx), f"{path}: probe state indices differ from this run's"
+    assert cands.shape == tuple(shape), (cands.shape, shape)
+    assert hashlib.sha256(np.ascontiguousarray(cands).tobytes()).hexdigest() == actions_sha, f'{path}: corrupt'
+    return cands, dict(path=os.path.abspath(path), sha256=file_sha256(path), actions_sha256=actions_sha)
 
 
 def write_atomic(path, data):
@@ -449,7 +492,7 @@ class Trainer:
         self.mode = FLAGS.mode
         self.bc_select = None  # actor selection state (bc with --bc_select_threshold >= 0; set in setup)
         self.store = None
-        if self.mode != 'eval_actor':  # eval_actor: no checkpoints
+        if self.mode in ('bc', 'online'):  # eval_actor / probe tools: no checkpoints
             self.store = CheckpointStore(os.path.join(self.run_dir, 'ckpt'))
             self.store.test_delay = float(os.environ.get('V1_TEST_CKPT_DELAY', 0))  # e2e test: widen the write
         self.phases = ONLINE_PHASES if self.mode == 'online' else BC_PHASES
@@ -501,6 +544,8 @@ class Trainer:
         """Refuse to resume a run directory with different arguments."""
         flag_dict = {k: v for k, v in get_flag_dict().items() if k not in RESTART_FREE_FLAGS
                      and not (k in LATER_FLAG_DEFAULTS and v == LATER_FLAG_DEFAULTS[k])}
+        if isinstance(flag_dict.get('agent'), dict):
+            flag_dict['agent'] = strip_later_agent_defaults(flag_dict['agent'])
         path = os.path.join(self.run_dir, 'args.json')
         if os.path.exists(path):
             with open(path) as f:
@@ -552,22 +597,19 @@ class Trainer:
         np.random.seed(FLAGS.seed)
         self.action_key = jax.random.PRNGKey(FLAGS.seed + 7919)
 
+        # Replay sampling RNG: None = numpy's global state; separate: one Generator for both buffers.
+        self.replay_rng = None
+        if FLAGS.replay_rng == 'separate':
+            self.replay_rng = np.random.Generator(np.random.PCG64(FLAGS.seed + REPLAY_SEED_OFFSET))
         if self.mode == 'bc':
             self.demo_ds = Dataset.create(**{k: self.demos[k] for k in FIELDS})
         else:
             self.buffers = dict(
-                main=SeqReplay(self.demos, FLAGS.buffer_cap, self.H, episodic=False),
-                success=SeqReplay(self.demos, FLAGS.buffer_cap, self.H, episodic=True),
+                main=SeqReplay(self.demos, FLAGS.buffer_cap, self.H, episodic=False, rng=self.replay_rng),
+                success=SeqReplay(self.demos, FLAGS.buffer_cap, self.H, episodic=True, rng=self.replay_rng),
             )
 
-        # Probe states and noise: fixed for the whole run (visualization/critic_probe.py).
-        idx, self.probe_steps_left = probe_states(self.demos, self.H, FLAGS.probe_states, 0)
-        self.probe_obs = self.demos['observations'][idx]
-        self.probe_actions = np.stack([self.demos['actions'][i:i + self.H].reshape(-1) for i in idx])
-        rs = np.random.RandomState(1)
-        self.probe_noises = rs.standard_normal(
-            (len(idx), config['actor_num_samples'], self.probe_actions.shape[-1])).astype(np.float32)
-        self.probe_rand = rs.uniform(-1, 1, (len(idx), self.probe_actions.shape[-1])).astype(np.float32)
+        self.setup_probe(config)
 
         self.phase = self.phases[0]
         self.ctr = defaultdict(int)
@@ -585,8 +627,12 @@ class Trainer:
 
         self.metrics = MetricsLog(os.path.join(self.run_dir, 'metrics.jsonl'), self.metrics_offset)
         self.setup_wandb()
-        run_config = dict(method=FLAGS.method, agent_name=config['agent_name'], agent=config.to_dict(),
-                          init_actor=self.init_actor_info)
+        run_config = dict(method=FLAGS.method, agent_name=config['agent_name'],
+                          agent=strip_later_agent_defaults(config.to_dict()), init_actor=self.init_actor_info)
+        if self.probe_cands is not None:
+            run_config['probe_candidates'] = self.probe_cands_info
+        if FLAGS.replay_rng != 'global':
+            run_config['replay_rng'] = FLAGS.replay_rng
         import wandb
         wandb.config.update(dict(v1=run_config), allow_val_change=True)
         if self.metrics_offset == 0:  # first row of the run's log (rewritten if no checkpoint follows it)
@@ -595,6 +641,22 @@ class Trainer:
               f'actor_type={config["actor_type"]} actor_num_samples={config["actor_num_samples"]}', flush=True)
         self.t_last_ckpt = time.time()
         self.ob, self.action_queue, self.ep_rows = None, [], []
+
+    def setup_probe(self, config):
+        """Probe states and noise, fixed for the whole run (visualization/critic_probe.py); with
+        --probe_candidates the fixed candidate actions at those states."""
+        idx, self.probe_steps_left = probe_states(self.demos, self.H, FLAGS.probe_states, 0)
+        self.probe_idx = idx
+        self.probe_obs = self.demos['observations'][idx]
+        self.probe_actions = np.stack([self.demos['actions'][i:i + self.H].reshape(-1) for i in idx])
+        rs = np.random.RandomState(1)
+        self.probe_noises = rs.standard_normal(
+            (len(idx), config['actor_num_samples'], self.probe_actions.shape[-1])).astype(np.float32)
+        self.probe_rand = rs.uniform(-1, 1, (len(idx), self.probe_actions.shape[-1])).astype(np.float32)
+        self.probe_cands, self.probe_cands_info = None, None
+        if FLAGS.probe_candidates and self.mode != 'make_probe_candidates':
+            self.probe_cands, self.probe_cands_info = load_probe_candidates(FLAGS.probe_candidates, idx,
+                                                                            self.probe_noises.shape)
 
     def setup_wandb(self):
         import wandb
@@ -627,6 +689,8 @@ class Trainer:
         if self.mode == 'online':
             state['buffers'] = {k: b.meta() for k, b in self.buffers.items()}
             state['demo_crc'] = self.demo_crc()
+        if getattr(self, 'replay_rng', None) is not None:  # --replay_rng=separate only (default format unchanged)
+            state['replay_rng'] = self.replay_rng.bit_generator.state
         if self.bc_select is not None:
             state['bc_select'] = self.bc_select
         return state
@@ -670,6 +734,9 @@ class Trainer:
             assert state['demo_crc'] == self.demo_crc(), 'demo data differ from the checkpointed run'
             for k, b in self.buffers.items():
                 b.restore(state['buffers'][k], self.store.iter_segments(k))
+        if getattr(self, 'replay_rng', None) is not None:
+            assert 'replay_rng' in state, 'checkpoint has no replay Generator state'
+            self.replay_rng.bit_generator.state = state['replay_rng']
         if self.bc_select is not None:
             self.bc_select = state['bc_select']
             self.restore_best_actor()
@@ -771,15 +838,29 @@ class Trainer:
         self.eval_envs.call('v1_reseed')
 
     def probe(self):
-        parts = [probe_batch(self.agent, self.probe_obs[s:s + 256], self.probe_actions[s:s + 256],
-                             self.probe_noises[s:s + 256], self.probe_rand[s:s + 256], jax.random.PRNGKey(0))
+        """Current-actor probe ({key: value}, logged under probe/). Ties on the final ensemble score (integer S
+        for acarb sample_mean, the aggregated Q otherwise). Uses only the fixed probe key PRNGKey(0)."""
+        integer = uses_integer_score(self.agent)
+        fn = probe_batch_scores if integer else probe_batch
+        parts = [fn(self.agent, self.probe_obs[s:s + 256], self.probe_actions[s:s + 256],
+                    self.probe_noises[s:s + 256], self.probe_rand[s:s + 256], jax.random.PRNGKey(0))
                  for s in range(0, len(self.probe_obs), 256)]
         q_data, q_cand, q_rand = (np.concatenate([np.asarray(x[k]) for x in parts]) for k in range(3))
-        return dict(tie_rate=float((q_cand.max(1) == q_cand.min(1)).mean()),
+        s_cand = np.concatenate([np.asarray(x[3]) for x in parts]) if integer else q_cand
+        tie_all, tie_max = tie_stats(s_cand)
+        return dict(tie_rate=tie_all,
+                    tie_max=tie_max,
                     progress_spearman=float(spearmanr(q_data, -self.probe_steps_left).correlation),
                     q_data_mean=float(q_data.mean()),
                     cand_range_mean=float((q_cand.max(1) - q_cand.min(1)).mean()),
                     data_gt_random=float((q_data > q_rand).mean()))
+
+    def probe_row(self):
+        """probe/* and, with --probe_candidates, probe_fixed/* and probe_stab/*."""
+        row = {f'probe/{k}': v for k, v in self.probe().items()}
+        if self.probe_cands is not None:
+            row.update(probe_fixed(self.agent, self.probe_obs, self.probe_cands))
+        return row
 
     def run_eval(self, nominal, step, rules, with_probe):
         """Evaluate + probe, log, then checkpoint. On a preemption notice: checkpoint without it and exit."""
@@ -793,7 +874,7 @@ class Trainer:
         for rule, r in res.items():
             row.update({f'{rule}/{k}': v for k, v in r.items()})
         if with_probe:
-            row.update({f'probe/{k}': v for k, v in self.probe().items()})
+            row.update(self.probe_row())
         self.metrics.log('eval', step, row)
         print('EVAL ' + json.dumps({k: v for k, v in row.items() if 'episode.' not in k}), flush=True)
         self.last_eval = nominal
@@ -1030,7 +1111,7 @@ class Trainer:
             row.update({f'{rule}/{k}': v for k, v in r.items()})
         if os.environ.get('V1_TEST_RAISE_IN_PRETRAIN_EVAL'):  # test hook: where job 10888854 failed (probe)
             raise ValueError('V1_TEST_RAISE_IN_PRETRAIN_EVAL')
-        row.update({f'probe/{k}': v for k, v in self.probe().items()})
+        row.update(self.probe_row())
         self.metrics.log('pretrain_eval', self.ctr['env_steps'], row)
         print('EVAL ' + json.dumps({k: v for k, v in row.items() if 'episode.' not in k}), flush=True)
         self.last_eval = self.ctr['env_steps']
