@@ -95,7 +95,7 @@ def runs(tmp_path_factory):
         jobs[f'B{variant}'] = lambda n=f'B{variant}', a=args: run([*a, f'--run_dir={d / n}'], d, n)
         jobs[f'B{variant}p'] = lambda n=f'B{variant}p', a=args, s=src: run([*a, f'--run_dir={d / n}'], d, n,
                                                                            cwd=str(srcs[s]))
-    with ThreadPoolExecutor(int(os.environ.get('GEO3C_E2E_WORKERS', 8))) as ex:
+    with ThreadPoolExecutor(int(os.environ.get('GEO3C_E2E_WORKERS', 6))) as ex:
         futs = {k: ex.submit(f) for k, f in jobs.items()}
         out = {k: f.result() for k, f in futs.items()}
     return d, out, setups
@@ -170,15 +170,29 @@ def test_bsc_rows_match_base(variant, runs):
         {k: v for k, v in old_args.items() if k not in ('run_dir', 'init_actor')}
 
 
+def refuse_other_value_family(d, actor, cands, src):
+    """A run dir holding only the QC run's args.json (a finished run exits RUN_ALREADY_COMPLETE before the args
+    check): resuming it as ARB-BSC (--method=arb_bsc, or --agent.arb_value=bsc) is refused, args.json untouched."""
+    out = []
+    for method, extra in (('arb_bsc', ['--agent.discount=1.0']),
+                          ('arb_qc', ['--agent.arb_value=bsc', '--agent.discount=1.0'])):
+        rd = d / f'refuse_{method}'
+        os.makedirs(rd, exist_ok=True)
+        args = json.load(open(src / 'args.json'))
+        args['run_dir'] = str(rd)
+        with open(rd / 'args.json', 'w') as f:
+            json.dump(args, f, indent=1)
+        before = open(rd / 'args.json').read()
+        r = run([*common(5), *ONLINE, f'--init_actor={actor}', *recipe_args('E1', method, cands), *extra,
+                 f'--run_dir={rd}'], d, f'refuse_{method}')
+        mism = [l for l in r['lines'] if l.startswith('ARGS_MISMATCH')]
+        assert r['rc'] == 2 and mism and 'resolved_agent' in mism[0], r['lines'][-20:]
+        assert open(rd / 'args.json').read() == before
+        out.append(mism[0])
+    return out
+
+
 def test_resume_refuses_other_value_family(runs):
     d, out, setups = runs
-    actor, cands = setups[5]
-    src = d / 'QE1'
-    before = open(src / 'args.json').read()
-    for method, extra in (('arb_bsc', ['--agent.discount=1.0']), ('arb_qc', ['--agent.arb_value=bsc',
-                                                                            '--agent.discount=1.0'])):
-        args = [*common(5), *ONLINE, f'--init_actor={actor}', *recipe_args('E1', method, cands), *extra,
-                f'--run_dir={src}']
-        r = run(args, d, f'refuse_{method}')
-        assert r['rc'] == 2 and any(l.startswith('ARGS_MISMATCH') for l in r['lines']), r['lines'][-20:]
-    assert open(src / 'args.json').read() == before
+    for line in refuse_other_value_family(d, *setups[5], d / 'QE1'):
+        print(line[:300])
