@@ -313,13 +313,28 @@ def check_agent_config(mode, config):
         readout, label = config['arb_readout'], config.get('arb_label', 'hard')
         if readout == 'sample_mean' and config['q_agg'] != 'mean':
             errors.append(f"arb_readout=sample_mean needs q_agg=mean (got {config['q_agg']})")
-        if label != 'hard' and (config['arb_value'] != 'bsc' or readout != 'sample_mean'):
-            errors.append(f"arb_label={label} needs arb_value=bsc and arb_readout=sample_mean "
-                          f"(got {config['arb_value']}, {readout})")
+        if label != 'hard' and readout != 'sample_mean':
+            errors.append(f"arb_label={label} needs arb_readout=sample_mean (got {readout})")
         errors.extend(geo_config_errors(config))
     if errors:
         print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
         sys.exit(2)
+
+
+def target_family(config):
+    """W&B target family of acarb runs: 'ARB-QC-better' (arb_value='qc') or 'ARB-BSC'; None for other agents."""
+    if config['agent_name'] != 'acarb':
+        return None
+    return 'ARB-QC-better' if config['arb_value'] == 'qc' else 'ARB-BSC'
+
+
+def resolved_qc_args(config):
+    """args.json entry of sampled-readout ARB-QC runs (geo3c): the resolved value family and discount, so a resume
+    with a different --method / --agent.arb_value / --agent.discount is refused. None otherwise (args.json of
+    every other run unchanged)."""
+    if config['agent_name'] != 'acarb' or config['arb_value'] != 'qc' or config['arb_readout'] != 'sample_mean':
+        return None
+    return dict(arb_value=config['arb_value'], discount=config['discount'], target_family=target_family(config))
 
 
 def strip_later_agent_defaults(agent_dict):
@@ -544,12 +559,15 @@ class Trainer:
         return getattr(self, 'phase', None)
 
     # ---- setup ----------------------------------------------------------------------------------
-    def check_args(self):
-        """Refuse to resume a run directory with different arguments."""
+    def check_args(self, config=None):
+        """Refuse to resume a run directory with different arguments (config: the resolved agent config)."""
         flag_dict = {k: v for k, v in get_flag_dict().items() if k not in RESTART_FREE_FLAGS
                      and not (k in LATER_FLAG_DEFAULTS and v == LATER_FLAG_DEFAULTS[k])}
         if isinstance(flag_dict.get('agent'), dict):
             flag_dict['agent'] = strip_later_agent_defaults(flag_dict['agent'])
+        resolved = resolved_qc_args(config) if config is not None else None
+        if resolved is not None:
+            flag_dict['resolved_agent'] = resolved
         path = os.path.join(self.run_dir, 'args.json')
         if os.path.exists(path):
             with open(path) as f:
@@ -565,9 +583,9 @@ class Trainer:
             os.replace(path + '.tmp', path)
 
     def setup(self):
-        if self.mode != 'eval_actor':
-            self.check_args()
         config = resolve_agent_config(FLAGS.method, FLAGS.agent, sys.argv)
+        if self.mode != 'eval_actor':
+            self.check_args(config)
         config['horizon_length'] = FLAGS.horizon_length
         check_agent_config(self.mode, config)
         self.config = config
@@ -639,6 +657,11 @@ class Trainer:
             run_config['replay_rng'] = FLAGS.replay_rng
         import wandb
         wandb.config.update(dict(v1=run_config), allow_val_change=True)
+        family = target_family(config)
+        if family is not None:  # W&B only: the metrics config row is unchanged
+            wandb.config.update(dict(target_family=family), allow_val_change=True)
+            if wandb.run is not None and not getattr(wandb.run, 'disabled', False):
+                wandb.run.tags = tuple(dict.fromkeys((*(wandb.run.tags or ()), family)))
         if self.metrics_offset == 0:  # first row of the run's log (rewritten if no checkpoint follows it)
             self.metrics.log('config', 0, run_config, wandb_too=False)
         print(f'CONFIG method={FLAGS.method} agent={config["agent_name"]} '
