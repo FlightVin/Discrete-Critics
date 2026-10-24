@@ -425,8 +425,9 @@ class ACARBAgent(flax.struct.PyTreeNode):
                 return geo_codes.class_to_token(jnp.argmax(logits / temp + gumbel, axis=-1).astype(jnp.int32))
 
         L = self.config['arb_length']
+        length = {} if L == geo_codes.LENGTH else dict(length=L)  # L = 3: build's default (call unchanged)
         q, rollin, binfo = geo_codes.build(k, self.config['arb_label'], self.config['arb_rollin'], rollin_rng,
-                                           model_token, k_den=self.readout_den(), length=L)
+                                           model_token, k_den=self.readout_den(), **length)
         q, rollin = sg(q), sg(rollin)
         logits = self._percopy_critic(False, params=grad_params['modules_critic'])(
             observations, actions, to_classes(rollin))  # (num_qs, batch, L, 54)
