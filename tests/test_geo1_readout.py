@@ -278,7 +278,10 @@ def test_config_refusals():
         e_agent(q_agg='min')
     with pytest.raises(AssertionError):
         e_agent(label='twohot_all', readout='greedy')
+    with pytest.raises(AssertionError):  # geo3c: sampled-readout QC needs one next chunk and gamma 0.99
+        e_agent(label='twohot_last', arb_value='qc', discount=0.99, critic_target_bon=True)
     with pytest.raises(AssertionError):
-        e_agent(label='twohot_last', arb_value='qc', discount=0.99)
+        e_agent(label='twohot_last', arb_value='qc', discount=1.0)
+    e_agent(label='twohot_last', arb_value='qc', discount=0.99)  # geo3c: now allowed
     e_agent(label='hard', readout='sample_mean')
     e_agent(label='hard', readout='greedy')
