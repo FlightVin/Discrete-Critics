@@ -99,9 +99,10 @@ def test_raw_u_inverse_and_cap():
     np.testing.assert_allclose(np.asarray(raw_to_u(u_to_raw(jnp.asarray(u)))), u, atol=1e-6)
     q = np.linspace(-100, -0.1, 1001, dtype=np.float32)
     np.testing.assert_allclose(np.asarray(u_to_raw(raw_to_u(jnp.asarray(q)))), q, atol=2e-5)  # 2 ulp at 100
-    # Exact inverses as rational maps (the functions are plain arithmetic).
-    for x in (Fraction(0), Fraction(999, 1000), Fraction(12345, 10 ** 6), Fraction(1, 3)):
-        assert raw_to_u(u_to_raw(x)) == x and u_to_raw(raw_to_u(x - 100)) == x - 100
+    # Inverses in float64 (QC_SCALE = 100.0).
+    for x in (0.0, 0.999, 0.012345, 1 / 3):
+        assert raw_to_u(u_to_raw(x)) == pytest.approx(x, abs=1e-13)
+        assert u_to_raw(raw_to_u(x - 100)) == pytest.approx(x - 100, abs=1e-12)
     # Largest decodable value: u = 0.999 -> Qhat = -0.1 (exactly in rationals; float32 within 1 ulp of 100).
     assert QC_K_TOP == 999_000 and Fraction(QC_K_TOP, QC_K_DEN) * 100 - 100 == Fraction(-1, 10)
     assert abs(float(u_to_raw(jnp.float32(0.999))) + 0.1) < 1e-5
@@ -193,8 +194,8 @@ def test_td_target_against_fraction(H, monkeypatch):
     # gamma^3 instead of gamma^H would differ visibly on bootstrapped rows.
     wrong = R[2] + 0.99 ** 3 * (100 * S[2] / k_den - 100)
     assert abs(wrong - y[2]) > 0.01
-    assert float(info['target_clip_hi_frac']) == np.mean([ref_k(v)[2] for v in y])
-    assert float(info['target_clip_lo_frac']) == np.mean([ref_k(v)[1] for v in y])
+    assert float(info['target_clip_hi_frac']) == pytest.approx(np.mean([ref_k(v)[2] for v in y]), abs=1e-7)
+    assert float(info['target_clip_lo_frac']) == pytest.approx(np.mean([ref_k(v)[1] for v in y]), abs=1e-7)
 
 
 def test_td_target_draws_one_actor_chunk(monkeypatch):
@@ -273,10 +274,13 @@ def test_loss_labels_match_label_functions_on_kq(variant, monkeypatch):
             ce = soft_cross_entropy(logits, q[None])
             # Label means: canonical digits, then T(r_3) on the actual (canonical) prefix: r_3 exact.
             means = np.asarray((q * jnp.arange(10)).sum(-1))
+            clipped = 0
             for i in range(64):
-                r3 = Fraction(int(k[i]) - 1000 * int(k[i] // 1000), 1000)
-                assert abs(means[i, 2] - float(r3)) < 1e-6
-            assert float(info['label_clip_pos3']) == 0.0
+                r3 = Fraction(int(k[i]) - 1000 * 10 * int(k[i] // 10000), 1000)  # prefix P = 100 d1 + 10 d2
+                assert 0 <= r3 < 10
+                clipped += r3 > 9  # ordinary clamp to the last class (as BSC)
+                assert abs(means[i, 2] - float(min(r3, Fraction(9)))) < 1e-5
+            assert float(info['label_clip_pos3']) == pytest.approx(clipped / 64, abs=1e-7)
         ref = (ce.mean(axis=(0, 2)) * w).mean()
         assert float(loss) == pytest.approx(float(ref), rel=1e-6, abs=1e-7)
         return
@@ -394,7 +398,7 @@ def test_model_branch_is_current_copy_at_temp(variant, monkeypatch):
 def test_qc_recipes_allowed(variant):
     cfg = qc_cfg(variant)
     assert geo_config_errors(cfg) == []
-    T.check_agent_config('online', cfg)  # no exit (needs --method only via FLAGS: checked in e2e)
+    T.check_agent_config('bc', cfg)  # no exit ('online' also needs --method: checked in the e2e test)
 
 
 @pytest.mark.parametrize('over', [dict(critic_target_bon=True), dict(discount=1.0), dict(discount=0.995),
