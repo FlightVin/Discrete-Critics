@@ -409,7 +409,7 @@ def test_readout_diagnostics_and_update_redundant():
 BAD = [
     dict(arb_vocab='redundant', arb_label='corrective', arb_rollin='canonical'),
     dict(arb_vocab='redundant', arb_label='noisy_fixed', arb_rollin='corrective'),
-    dict(arb_vocab='redundant', arb_label='noisy_resid', arb_rollin='model_mix'),
+    dict(arb_vocab='redundant', arb_label='noisy_resid', arb_rollin='corrective'),
     dict(arb_vocab='redundant', arb_label='hard', arb_rollin='canonical'),
     dict(arb_vocab='redundant', arb_label='twohot_all', arb_rollin='fixed'),
     dict(arb_vocab='ordinary', arb_label='corrective', arb_rollin='corrective'),
