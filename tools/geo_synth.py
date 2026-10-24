@@ -1,7 +1,7 @@
-"""Synthetic context-to-scalar diagnostic for the ARB-BSC critic variants E0-E9 (inv/geo2b).
+"""Synthetic context-to-scalar diagnostic for the ARB-BSC critic variants E0-E11 (inv/geo2b, inv/geo3a).
 
 Recipe (fixed before fitting):
-  --variant E0..E9 --out <json> [--updates 20000]
+  --variant E0..E11 --out <json> [--updates 20000]
   Data (np.random.RandomState(123), drawn in this order): W1 (64, 16) and W2 (1, 64) ~ N(0, 1/fan_in), no biases;
     50,000 train x then 10,000 held-out x, x in R^16 ~ N(0, I). g(x) = W2 tanh(W1 x). Action input = zeros(35)
     (horizon 5 x action dim 7). u = k / 20000; s = sigmoid(3 g(x)); base k = round(19980 s); j = floor(999 s).
@@ -10,16 +10,16 @@ Recipe (fixed before fitting):
     Groups: base (p >= 6), k=0 (p=0), k=19980 (p=1), exact (p in {2,3}), boundary (p in {4,5}).
   Model: the real ACARBAgent critic of the variant's config (v1 arb_bsc, real sizes), 2 copies, init seed 0.
     E0: greedy readout + 'hard' labels (ordinary). E1-E4: ordinary vocabulary, sample_mean (M=10, T=0.7) with
-    arb_label hard / twohot_last / twohot_last2 / twohot_all. E5-E9: redundant vocabulary, sample_mean (M=10,
+    arb_label hard / twohot_last / twohot_last2 / twohot_all. E5-E11: redundant vocabulary, sample_mean (M=10,
     T=0.7) with (arb_label, arb_rollin) = (corrective, corrective) / (corrective, model_mix) / (corrective, fixed)
-    / (noisy_fixed, fixed) / (noisy_resid, fixed).
+    / (noisy_fixed, fixed) / (noisy_resid, fixed); E10, E11: (noisy_fixed, model_mix) / (noisy_resid, model_mix).
   Training: Adam 3e-4 on the critic params only, batch 256, --updates steps. Batch indices
     np.random.RandomState(0).randint(0, 50000, (updates, 256)); the roll-in key of update i is
     fold_in(PRNGKey(0), i). Targets k are supplied directly (no TD, no target network); the loss is the agent's
-    own critic_ce (labels / roll-ins exactly as its critic loss, E6 model roll-in included), averaged over
+    own critic_ce (labels / roll-ins exactly as its critic loss, E6 / E10 / E11 model roll-in included), averaged over
     copies and positions (all rows valid).
   Measures on the held-out set, with the variant's readout (E0: greedy, mean of the 2 copies' greedy values;
-    E1-E9: integer sample_mean S / 20000, M=10, T=0.7) in chunks of 1000 with chunk c keyed
+    E1-E11: integer sample_mean S / 20000, M=10, T=0.7) in chunks of 1000 with chunk c keyed
     fold_in(PRNGKey(7), c):
     bias = mean(value - u), mae = mean |value - u|, overall and per group; oor_frac = decoded values outside
     [0, 999] before the clip (per sampled code; E0: per greedy code).
@@ -65,6 +65,8 @@ VARIANTS = {
     'E7': dict(RED, arb_label='corrective', arb_rollin='fixed'),
     'E8': dict(RED, arb_label='noisy_fixed', arb_rollin='fixed'),
     'E9': dict(RED, arb_label='noisy_resid', arb_rollin='fixed'),
+    'E10': dict(RED, arb_label='noisy_fixed', arb_rollin='model_mix'),
+    'E11': dict(RED, arb_label='noisy_resid', arb_rollin='model_mix'),
 }
 GROUPS = ('base', 'k0', 'k19980', 'exact', 'boundary')
 OFFSETS = (-2, -1, 1, 2)
