@@ -2,13 +2,15 @@
 
 Pure, jit-compatible functions; nothing here touches an agent or a training loop.
 
-Code: base 10, 3 positions, weights w = (0.1, 0.01, 0.001). Targets live on an integer grid u = k / k_den
-(default K_DEN = 20000, must be a multiple of 1000; k in [0, 0.999 * k_den]). Tokens are SIGNED integers
+Code: base 10, L positions (default LENGTH = 3), weights w = (0.1, 0.01, ..., 10^-L). Targets live on an integer
+grid u = k / k_den (default K_DEN = 20000; k_den must be a positive multiple of 10^L; k in [0, (1 - 10^-L) k_den]).
+Every function takes `length` / `k_den` (defaults: the L = 3 code); the agent passes them explicitly. The docs
+below spell out L = 3 (L = 5: units of 10^-5, D_l = k_den / 10^(l+1), roll-ins at positions 1..4). Tokens are SIGNED integers
 t in [TOKEN_MIN, TOKEN_MAX] = [-22, 31] (54 classes); the class index of token t is t - TOKEN_MIN (= t + 22).
 Token values are always int32 "tokens"; class indices only appear as the last axis of `labels`.
 
-Exact integer arithmetic (int32). With prefix units P = 100 z1 + 10 z2 (units of 0.001) before position l,
-  N = k - (k_den / 1000) * P,   D_l = k_den * w_l = (k_den/10, k_den/100, k_den/1000),   r_l = N / D_l,
+Exact integer arithmetic (int32). With prefix units P = 100 z1 + 10 z2 (units of 10^-L = 0.001) before position l,
+  N = k - (k_den / 10^L) * P,   D_l = k_den * w_l = (k_den/10, k_den/100, k_den/1000),   r_l = N / D_l,
   c = N // D_l (floor toward -inf),   rem = N - c * D_l in [0, D_l),   f = eps = rem / D_l.
 
 Label modes (per position, distribution over tokens):
@@ -17,14 +19,14 @@ Label modes (per position, distribution over tokens):
   'noisy_resid' (E9)    0.5 (1 - f), 0.5, 0.5 f on c - 1, c, c + 1 (expected token r - 0.5; c + 1 not indexed if f = 0).
 Labels at a position depend on the ACTUAL prefix (earlier roll-in tokens), never on that position's own roll-in.
 
-Roll-in modes (context tokens fed at positions 1 and 2; nothing is fed after position 3):
+Roll-in modes (context tokens fed at positions 1..L-1 = 1 and 2; nothing is fed after position L = 3):
   'corrective' (E5)  z ~ T(r), i.e. z = c + Bernoulli(f) (drawn exactly as randint[0, D) < rem).
   'model_mix'  (E6)  with prob. 0.5 z ~ T(r), else z = clip(m, c - 2, c + 2) with m = model_token(prefix, position).
   'fixed'      (E7-E9) z = c + delta, delta uniform on {-2, ..., 2}.
 Randomness is independent per element, position and purpose (Bernoulli / mixture coin / delta), derived from one key.
 
 API
-  build(k, label_mode, rollin_mode, key, model_token=None, k_den=K_DEN) -> (labels, rollin, info)
+  build(k, label_mode, rollin_mode, key, model_token=None, k_den=K_DEN, length=LENGTH) -> (labels, rollin, info)
     k:        int (...)  grid units (any leading shape, e.g. (num_qs, batch)); floats are rounded (see units_from_value).
     labels:   float32 (..., 3, 54), rows sum to 1, stop-gradient.
     rollin:   int32 (..., 3) TOKEN values; rollin[..., 2] is always 0 (the final position's token is never fed).
@@ -34,12 +36,14 @@ API
               [c - 2, c + 2] when the model branch is used), 'model_used';
               float32 'oov_label_mass' (total mass that was outside, before clipping);
               plus per-element arrays 'c', 'rem', 'den' (int32 (..., 3)) and 'model_mask' (bool (..., 2)).
-    model_token(prefix_tokens, position) -> int32 (...): called for position 0 and 1 (0-indexed) with prefix_tokens
+    model_token(prefix_tokens, position) -> int32 (...): called for positions 0..L-2 (0-indexed) with prefix_tokens
               int32 (..., 3) holding the actual roll-in tokens before `position` and 0 elsewhere. The callback owns
               its randomness (fold `position` into its key so the two calls are independent).
-  label_and_info(k, prefix_tokens, label_mode, k_den) -> labels / info for a fixed prefix (used by build and tests).
-  residual(k, prefix_units, position, k_den) -> (c, rem, den);  label_support(c, rem, den, mode) -> (tokens, masses)
-  two_hot(c, rem, den) -> (..., 54);  decode_units(tokens) = 100 z1 + 10 z2 + z3 (units of 0.001).
+  label_and_info(k, prefix_tokens, label_mode, k_den) -> labels / info for a fixed prefix (used by build and tests);
+              L = prefix_tokens.shape[-1].
+  residual(k, prefix_units, position, k_den, length) -> (c, rem, den);  label_support(c, rem, den, mode) -> (tokens, masses)
+  two_hot(c, rem, den) -> (..., 54);  decode_units(tokens) = sum_i 10^(L-1-i) z_i = 100 z1 + 10 z2 + z3 at L = 3
+              (units of 10^-L, int32, never clipped).
   units_from_value(u, k_den) -> int32 round(u * k_den), stop-gradient.
 """
 
@@ -51,8 +55,8 @@ LENGTH = 3
 TOKEN_MIN = -22
 TOKEN_MAX = 31
 NUM_CLASSES = TOKEN_MAX - TOKEN_MIN + 1  # 54
-UNIT_WEIGHTS = (100, 10, 1)  # w_l in units of 0.001
-ROLLIN_POSITIONS = 2
+UNIT_WEIGHTS = (100, 10, 1)  # w_l in units of 0.001 (L = 3; see unit_weights)
+ROLLIN_POSITIONS = 2  # L - 1 at L = 3
 DELTA_MAX = 2
 
 LABEL_MODES = ('corrective', 'noisy_fixed', 'noisy_resid')
@@ -67,14 +71,19 @@ def class_to_token(classes):
     return classes + TOKEN_MIN
 
 
-def _check_k_den(k_den):
-    if k_den % 1000 != 0 or k_den <= 0:
-        raise ValueError(f'k_den must be a positive multiple of 1000, got {k_den}')
+def unit_weights(length=LENGTH):
+    """w_l in units of 10^-L: (10^(L-1), ..., 10, 1)."""
+    return tuple(10 ** (length - 1 - i) for i in range(length))
 
 
-def denominator(position, k_den=K_DEN):
+def _check_k_den(k_den, length=LENGTH):
+    if k_den % 10 ** length != 0 or k_den <= 0:
+        raise ValueError(f'k_den must be a positive multiple of {10 ** length}, got {k_den}')
+
+
+def denominator(position, k_den=K_DEN, length=LENGTH):
     """D_l = k_den * w_l (python int)."""
-    _check_k_den(k_den)
+    _check_k_den(k_den, length)
     return k_den // 10 ** (position + 1)
 
 
@@ -84,18 +93,19 @@ def units_from_value(u, k_den=K_DEN):
 
 
 def decode_units(tokens):
-    """Signed tokens (..., 3) -> value in units of 0.001: 100 z1 + 10 z2 + z3."""
+    """Signed tokens (..., L) -> value in units of 10^-L: sum_i 10^(L-1-i) z_i (100 z1 + 10 z2 + z3 at L = 3)."""
     tokens = jnp.asarray(tokens, jnp.int32)
-    return 100 * tokens[..., 0] + 10 * tokens[..., 1] + tokens[..., 2]
+    return sum(w * tokens[..., i] for i, w in enumerate(unit_weights(tokens.shape[-1])))
 
 
-def residual(k, prefix_units, position, k_den=K_DEN):
-    """Exact residual at `position` (0-indexed) given the prefix value in 0.001 units.
+def residual(k, prefix_units, position, k_den=K_DEN, length=LENGTH):
+    """Exact residual at `position` (0-indexed) given the prefix value in units of 10^-length.
 
-    Returns int32 (c, rem, den) with r = c + rem / den, c = floor(r), 0 <= rem < den.
+    Returns int32 (c, rem, den) with r = c + rem / den, c = floor(r), 0 <= rem < den. All intermediates are
+    bounded by |k| + (k_den / 10^L) |prefix_units| (no product k * 10^l).
     """
-    den = denominator(position, k_den)
-    num = jnp.asarray(k, jnp.int32) - (k_den // 1000) * jnp.asarray(prefix_units, jnp.int32)
+    den = denominator(position, k_den, length)
+    num = jnp.asarray(k, jnp.int32) - (k_den // 10 ** length) * jnp.asarray(prefix_units, jnp.int32)
     c = jnp.floor_divide(num, den)
     rem = num - c * den
     return c, rem, jnp.full_like(c, den)
@@ -137,44 +147,47 @@ def two_hot(c, rem, den):
 
 
 def _prefix_units(prefix_tokens, position):
-    return sum(UNIT_WEIGHTS[j] * prefix_tokens[..., j] for j in range(position))
+    weights = unit_weights(prefix_tokens.shape[-1])
+    return sum(weights[j] * prefix_tokens[..., j] for j in range(position))
 
 
 def label_and_info(k, prefix_tokens, label_mode, k_den=K_DEN):
-    """Labels (..., 3, 54) for a fixed prefix path prefix_tokens (..., 3) (the last token is ignored)."""
+    """Labels (..., L, 54) for a fixed prefix path prefix_tokens (..., L) (the last token is ignored)."""
     if label_mode not in LABEL_MODES:
         raise ValueError(f'unknown label_mode {label_mode!r}')
     prefix_tokens = jnp.asarray(prefix_tokens, jnp.int32)
-    cs, rems, dens = zip(*(residual(k, _prefix_units(prefix_tokens, l), l, k_den) for l in range(LENGTH)))
+    L = prefix_tokens.shape[-1]
+    cs, rems, dens = zip(*(residual(k, _prefix_units(prefix_tokens, l), l, k_den, L) for l in range(L)))
     c, rem, den = (jnp.stack(x, axis=-1) for x in (cs, rems, dens))
     labels, oov, oov_mass = _scatter(*label_support(c, rem, den, label_mode))
     info = {'oov_label': oov, 'oov_label_mass': oov_mass, 'c': c, 'rem': rem, 'den': den}
     return jax.lax.stop_gradient(labels), info
 
 
-def build(k, label_mode, rollin_mode, key, model_token=None, k_den=K_DEN):
+def build(k, label_mode, rollin_mode, key, model_token=None, k_den=K_DEN, length=LENGTH):
     """Sample one roll-in path per element and return (labels, rollin, info). See the module docstring."""
     if rollin_mode not in ROLLIN_MODES:
         raise ValueError(f'unknown rollin_mode {rollin_mode!r}')
     if rollin_mode == 'model_mix' and model_token is None:
         raise ValueError("rollin_mode='model_mix' needs a model_token callback")
-    _check_k_den(k_den)
+    _check_k_den(k_den, length)
+    positions = length - 1  # roll-in positions (ROLLIN_POSITIONS at L = 3)
     k = jax.lax.stop_gradient(jnp.asarray(k))
     if jnp.issubdtype(k.dtype, jnp.floating):
         k = jnp.round(k)
     k = k.astype(jnp.int32)
-    shape = k.shape + (ROLLIN_POSITIONS,)
+    shape = k.shape + (positions,)
     key_bern, key_coin, key_delta = jax.random.split(key, 3)
-    dens = jnp.array([denominator(l, k_den) for l in range(ROLLIN_POSITIONS)], jnp.int32)
+    dens = jnp.array([denominator(l, k_den, length) for l in range(positions)], jnp.int32)
     bern_u = jax.random.randint(key_bern, shape, 0, dens)  # Bernoulli(rem/den) == bern_u < rem, exactly
     coin = jax.random.bernoulli(key_coin, 0.5, shape)  # True -> model branch
     delta = jax.random.randint(key_delta, shape, -DELTA_MAX, DELTA_MAX + 1)
 
-    rollin = jnp.zeros(k.shape + (LENGTH,), jnp.int32)
+    rollin = jnp.zeros(k.shape + (length,), jnp.int32)
     model_mask = jnp.zeros(shape, bool)
     clamp = jnp.zeros(shape, bool)
-    for l in range(ROLLIN_POSITIONS):
-        c, rem, _ = residual(k, _prefix_units(rollin, l), l, k_den)
+    for l in range(positions):
+        c, rem, _ = residual(k, _prefix_units(rollin, l), l, k_den, length)
         corrective = c + (bern_u[..., l] < rem).astype(jnp.int32)
         if rollin_mode == 'corrective':
             z = corrective
@@ -191,7 +204,7 @@ def build(k, label_mode, rollin_mode, key, model_token=None, k_den=K_DEN):
     rollin = jax.lax.stop_gradient(rollin)
 
     labels, info = label_and_info(k, rollin, label_mode, k_den)
-    fed = rollin[..., :ROLLIN_POSITIONS]
+    fed = rollin[..., :positions]
     info.update(
         oov_rollin=jnp.sum((fed < TOKEN_MIN) | (fed > TOKEN_MAX), dtype=jnp.int32),
         model_clamp=jnp.sum(clamp, dtype=jnp.int32),

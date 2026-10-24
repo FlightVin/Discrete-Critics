@@ -63,7 +63,7 @@ from ml_collections import config_flags
 from scipy.stats import spearmanr
 
 from agents import V1_METHODS, agents, v1_config
-from agents.acarb import geo_config_errors
+from agents.acarb import geo_config_errors, int32_errors
 from envs.env_utils import make_env_and_datasets, make_vectorized_eval_envs
 from envs.robomimic_utils import get_max_episode_length, is_robomimic_env
 from evaluation import evaluate_parallel
@@ -317,6 +317,7 @@ def check_agent_config(mode, config):
             errors.append(f"arb_label={label} needs arb_value=bsc and arb_readout=sample_mean "
                           f"(got {config['arb_value']}, {readout})")
         errors.extend(geo_config_errors(config))
+        errors.extend(int32_errors(config))
     if errors:
         print('CONFIG_REFUSED ' + '; '.join(errors), flush=True)
         sys.exit(2)

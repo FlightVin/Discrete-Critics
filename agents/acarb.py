@@ -17,7 +17,10 @@ VOCABS = ('ordinary', 'redundant')
 ROLLINS = ('canonical',) + geo_codes.ROLLIN_MODES
 # geo2b: the allowed (arb_label, arb_rollin) pairs of the redundant vocabulary.
 GEO_COMBOS = {('corrective', 'corrective'): 'E5', ('corrective', 'model_mix'): 'E6', ('corrective', 'fixed'): 'E7',
-              ('noisy_fixed', 'fixed'): 'E8', ('noisy_resid', 'fixed'): 'E9'}
+              ('noisy_fixed', 'fixed'): 'E8', ('noisy_resid', 'fixed'): 'E9',
+              ('noisy_fixed', 'model_mix'): 'E10', ('noisy_resid', 'model_mix'): 'E11'}
+# geo3b: code lengths of the redundant vocabulary (coverage of [-22, 31] is proven for these, tests/test_geo3b_*).
+REDUNDANT_LENGTHS = (geo_codes.LENGTH, 5)
 
 
 def geo_config_errors(config):
@@ -36,9 +39,28 @@ def geo_config_errors(config):
                       f'got ({label}, {rollin})')
     if get('arb_readout', None) != 'sample_mean' or get('arb_value', 'bsc') != 'bsc':
         errors.append('arb_vocab=redundant needs arb_readout=sample_mean and arb_value=bsc')
-    if (get('arb_base', None), get('arb_length', None)) != (10, geo_codes.LENGTH):
-        errors.append('arb_vocab=redundant needs arb_base=10 and arb_length=3')
+    if get('arb_base', None) != 10 or get('arb_length', None) not in REDUNDANT_LENGTHS:
+        errors.append(f'arb_vocab=redundant needs arb_base=10 and arb_length in {REDUNDANT_LENGTHS}')
     return errors
+
+
+def int32_errors(config):
+    """Errors (list of str) if the sample_mean integer label arithmetic can leave int32.
+
+    k_den = B^L num_qs M; every target k is in [0, k_den). The largest intermediates are the residual numerators
+    N = k - (k_den / B^L) P_L (P_L: prefix in units of B^-L), |P_L| <= t_max (B^L - 1) / (B - 1) with t_max the
+    largest token magnitude (B - 1 ordinary, 31 redundant), so |N| < k_den (1 + t_max / (B - 1)); c D_l and
+    rem are bounded by |N| + D_l. The score S <= num_qs M (B^L - 1) < k_den."""
+    get = lambda key, default: config[key] if key in config else default
+    if get('arb_readout', None) != 'sample_mean':
+        return []
+    B, L = config['arb_base'], config['arb_length']
+    k_den = B ** L * config['num_qs'] * config['arb_readout_samples']
+    t_max = max(-geo_codes.TOKEN_MIN, geo_codes.TOKEN_MAX) if get('arb_vocab', 'ordinary') == 'redundant' else B - 1
+    bound = k_den + k_den * t_max // (B - 1) + 2 * k_den // B
+    if bound >= 2 ** 31:
+        return [f'int32 label arithmetic overflows (k_den={k_den}, bound {bound} >= 2^31)']
+    return []
 
 
 def ar_bin(y, base, length):
@@ -86,19 +108,29 @@ def ar_sample_codes(critic_fn, observations, actions, gumbel, temp):
     return digits
 
 
+def canonical_digits(k, k_den, base, length):
+    """Canonical digits of u = k / k_den from the integer k alone: n = k // (k_den / B^L) = floor(B^L u), clipped
+    to [0, B^L - 1], then its L base-B digits (..., L). Equals ar_bin(k / k_den) on the grid at L = 3; at L = 5 a
+    float32 k / k_den is off by up to ~0.006 code units, so digits are never taken from the float."""
+    n = jnp.clip(jnp.asarray(k, jnp.int32) // (k_den // base ** length), 0, base ** length - 1)
+    powers = base ** jnp.arange(length - 1, -1, -1, dtype=jnp.int32)
+    return (n[..., None] // powers) % base
+
+
 def ar_label_dists(k, k_den, base, length, mode):
     """Exact digit labels for targets on the grid u = k / k_den (k int32).
 
-    Returns (d, q, clip): d (..., L) canonical digits ar_bin(u) (the roll-in), q (..., L, B) label
+    Returns (d, q, clip): d (..., L) canonical digits (the roll-in, canonical_digits), q (..., L, B) label
     distributions and clip (..., L) whether the position's residual was clamped to [0, B-1].
     Positions before `first soft` are one-hot d_l; the others are two-hot T(r_l) with
     r_l = (u - v_prefix) / w_l, v_prefix = dec(d_1..d_{l-1}), w_l = B^-l, computed in integers:
-    r_l = (k B^l - B P_l k_den) / k_den with P_l the integer prefix code, floor by integer floor
-    division (toward -inf), f = remainder / k_den (f = 0 exactly for exact codes, then one class).
+    with D_l = k_den / B^(l+1) and P_l the integer prefix code (units of B^-l), N = k - B D_l P_l,
+    c = N // D_l (floor toward -inf), rem = N - c D_l, f = rem / D_l (f = 0 exactly for exact codes, then one
+    class). No intermediate exceeds |N| + D_l (int32-safe for k_den up to ~10^9, see int32_errors).
     """
     first_soft = {'hard': length, 'twohot_last': length - 1, 'twohot_last2': length - 2, 'twohot_all': 0}[mode]
     k = jnp.asarray(k, jnp.int32)
-    d = ar_bin(k.astype(jnp.float32) / k_den, base, length)
+    d = canonical_digits(k, k_den, base, length)
     qs, clips = [], []
     for l in range(length):
         onehot = jax.nn.one_hot(d[..., l], base)
@@ -107,14 +139,15 @@ def ar_label_dists(k, k_den, base, length, mode):
             clips.append(jnp.zeros(k.shape, bool))
             continue
         prefix = ar_code(d[..., :l], base) if l > 0 else jnp.zeros_like(k)
-        num = k * base ** (l + 1) - prefix * base * k_den
-        a = num // k_den
-        rem = num - a * k_den  # in [0, k_den)
+        den = k_den // base ** (l + 1)
+        num = k - base * den * prefix
+        a = num // den
+        rem = num - a * den  # in [0, den)
         low = num < 0
         high = (a > base - 1) | ((a == base - 1) & (rem > 0))
         clip = low | high
         a = jnp.clip(a, 0, base - 1)
-        f = jnp.where(clip, 0.0, rem.astype(jnp.float32) / k_den)
+        f = jnp.where(clip, 0.0, rem.astype(jnp.float32) / den)
         lo = jax.nn.one_hot(a, base)
         hi = jax.nn.one_hot(jnp.minimum(a + 1, base - 1), base)
         q = jnp.where((f > 0)[..., None], (1.0 - f)[..., None] * lo + f[..., None] * hi, lo)
@@ -347,7 +380,9 @@ class ACARBAgent(flax.struct.PyTreeNode):
             return self._geo_ce(observations, actions, target_k, grad_params, rollin_rng, w)
         info = {}
         if label_mode == 'hard':
-            labels = ar_bin(target_q, B, L)  # (batch, L)
+            # sample_mean: digits of the integer target (== ar_bin(target_q) at L = 3, exact at any L).
+            labels = ar_bin(target_q, B, L) if target_k is None else \
+                canonical_digits(target_k, self.readout_den(), B, L)  # (batch, L)
         else:
             labels, label_q, label_clip = ar_label_dists(target_k, self.readout_den(), B, L, label_mode)
 
@@ -389,19 +424,24 @@ class ACARBAgent(flax.struct.PyTreeNode):
                 gumbel = jax.random.gumbel(jax.random.fold_in(model_rng, position), logits.shape)
                 return geo_codes.class_to_token(jnp.argmax(logits / temp + gumbel, axis=-1).astype(jnp.int32))
 
+        L = self.config['arb_length']
         q, rollin, binfo = geo_codes.build(k, self.config['arb_label'], self.config['arb_rollin'], rollin_rng,
-                                           model_token, k_den=self.readout_den())
+                                           model_token, k_den=self.readout_den(), length=L)
         q, rollin = sg(q), sg(rollin)
         logits = self._percopy_critic(False, params=grad_params['modules_critic'])(
             observations, actions, to_classes(rollin))  # (num_qs, batch, L, 54)
         ce = soft_cross_entropy(logits, q)  # (num_qs, batch, L)
 
-        # Label bias: prefix value of the roll-ins + w_3 E_{q_3}[token] - u, in units of 0.001 then scaled.
+        # Label bias: prefix value of the roll-ins + w_L E_{q_L}[token] - u, in units of 10^-L then scaled.
         tokens = geo_codes.class_to_token(jnp.arange(geo_codes.NUM_CLASSES)).astype(jnp.float32)
         last = (q[..., -1, :] * tokens).sum(-1)
-        prefix = geo_codes.decode_units(rollin.at[..., -1].set(0)).astype(jnp.float32)
-        bias = (prefix + last - k.astype(jnp.float32) / (self.readout_den() // 1000)) / 1000
-        n_model = num_qs * target_k.shape[0] * geo_codes.ROLLIN_POSITIONS
+        prefix = geo_codes.decode_units(rollin.at[..., -1].set(0))
+        g = self.readout_den() // 10 ** L
+        if L == geo_codes.LENGTH:
+            bias = (prefix.astype(jnp.float32) + last - k.astype(jnp.float32) / g) / 10 ** L
+        else:  # values ~10^5 code units: subtract the integer part of k / g exactly before going to float32
+            bias = ((prefix - k // g).astype(jnp.float32) + last - (k % g).astype(jnp.float32) / g) / 10 ** L
+        n_model = num_qs * target_k.shape[0] * (L - 1)
         info = {
             'oov_label': binfo['oov_label'].astype(jnp.float32),
             'oov_rollin': binfo['oov_rollin'].astype(jnp.float32),
@@ -481,7 +521,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
         observations = batch['observations']
         greedy_q = self.critic_value(observations, actions, readout='greedy')
         wb = jnp.broadcast_to(batch['valid'][..., -1], greedy_q.shape)
-        if self._redundant():
+        if self._redundant() or L > geo_codes.LENGTH:
             return self._redundant_readout_diagnostics(observations, actions, greedy_q, wb, batch, rng)
         expected_q = sg(self.critic_value(observations, actions, readout='expected'))
         digit1_p = jax.nn.softmax(sg(self.network.select('critic')(
@@ -512,8 +552,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
         return {f'critic/{k}': v for k, v in info.items()}
 
     def _redundant_readout_diagnostics(self, observations, actions, greedy_q, wb, batch, rng):
-        """readout_diagnostics for the redundant vocabulary: greedy (decoded tokens, final value clipped) and the
-        run's readout; no exact expectation (54^2 prefixes per element)."""
+        """readout_diagnostics for the redundant vocabulary or L > 3: greedy (decoded tokens, final value clipped)
+        and the run's readout; no exact expectation (54^(L-1) or B^(L-1) prefixes per element)."""
         sg = jax.lax.stop_gradient
         L = self.config['arb_length']
         greedy_n = self._decode(self.network.select('critic')(observations, actions))
@@ -746,8 +786,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
         assert not geo_errors, '; '.join(geo_errors)
         if config['arb_readout'] == 'sample_mean':
             assert config['q_agg'] == 'mean', 'arb_readout=sample_mean needs q_agg=mean'
-            k_den = config['arb_base'] ** config['arb_length'] * config['num_qs'] * config['arb_readout_samples']
-            assert k_den * config['arb_base'] ** config['arb_length'] < 2 ** 31, 'int32 label arithmetic overflows'
+            int_errors = int32_errors(config)
+            assert not int_errors, '; '.join(int_errors)
         if label != 'hard':
             assert config['arb_value'] == 'bsc' and config['arb_readout'] == 'sample_mean', \
                 f'arb_label={label} needs arb_value=bsc and arb_readout=sample_mean (integer target grid)'
