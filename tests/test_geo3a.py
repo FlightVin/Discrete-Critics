@@ -87,8 +87,11 @@ def check_labels_exact(ks, labels, rollin, info, mode):
 def test_combos():
     assert GEO_COMBOS[NEW['E10']] == 'E10' and GEO_COMBOS[NEW['E11']] == 'E11' and len(GEO_COMBOS) == 7
     for v, (label, rollin) in NEW.items():
-        assert geo_config_errors(dict(arb_vocab='redundant', arb_label=label, arb_rollin=rollin,
-                                      arb_readout='sample_mean', arb_base=10, arb_length=3)) == [], v
+        bsc = dict(arb_vocab='redundant', arb_label=label, arb_rollin=rollin,
+                   arb_readout='sample_mean', arb_base=10, arb_length=3, discount=1.0)
+        assert geo_config_errors(bsc) == [], v
+        assert geo_config_errors(dict(bsc, arb_value='qc', discount=0.99, critic_target_bon=False)) == [], v
+        assert geo_config_errors(dict(bsc, discount=0.99)), v  # BSC sample_mean still needs discount=1
     hashes = {v: leaf_hashes(g_agent(v, split=False).network.params) for v in ('E6', 'E10', 'E11')}
     assert hashes['E10'] == hashes['E6'] and hashes['E11'] == hashes['E6']
 
