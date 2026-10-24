@@ -15,9 +15,10 @@ from utils.networks import ActorVectorField, ARCritic, ensemblize
 GEO1_LABELS = ('hard', 'twohot_last', 'twohot_last2', 'twohot_all')
 VOCABS = ('ordinary', 'redundant')
 ROLLINS = ('canonical',) + geo_codes.ROLLIN_MODES
-# geo2b: the allowed (arb_label, arb_rollin) pairs of the redundant vocabulary.
+# geo2b / geo3a: the allowed (arb_label, arb_rollin) pairs of the redundant vocabulary.
 GEO_COMBOS = {('corrective', 'corrective'): 'E5', ('corrective', 'model_mix'): 'E6', ('corrective', 'fixed'): 'E7',
-              ('noisy_fixed', 'fixed'): 'E8', ('noisy_resid', 'fixed'): 'E9'}
+              ('noisy_fixed', 'fixed'): 'E8', ('noisy_resid', 'fixed'): 'E9',
+              ('noisy_fixed', 'model_mix'): 'E10', ('noisy_resid', 'model_mix'): 'E11'}
 
 
 def geo_config_errors(config):
@@ -367,10 +368,10 @@ class ACARBAgent(flax.struct.PyTreeNode):
         return ce, logits, labels[None], info
 
     def _geo_ce(self, observations, actions, target_k, grad_params, rollin_rng, w):
-        """Redundant vocabulary (E5-E9): one geo_codes.build prefix path per element and per copy.
+        """Redundant vocabulary (E5-E11): one geo_codes.build prefix path per element and per copy.
 
         k is broadcast to (num_qs, batch); each copy is teacher-forced on its own roll-in classes with
-        grad_params. E6 (model_mix): the model token at a position is ONE sample at arb_readout_temp from the
+        grad_params. E6 / E10 / E11 (model_mix): the model token at a position is ONE sample at arb_readout_temp from the
         current copy (stop-gradient params) given that copy's actual prefix, with noise
         fold_in(model_rng, position). model_rng = split(rollin_rng, 4)[3]: build uses split(rollin_rng, 3)
         (with partitionable threefry split(k, n)[i] does not depend on n, so index 3 is disjoint from it)."""

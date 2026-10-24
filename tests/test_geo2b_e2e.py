@@ -25,7 +25,8 @@ from test_geo1_e2e import COMMON, ONLINE, H, e_args, rows, run  # noqa: E402
 
 PARENT = os.environ.get('GEO2B_PARENT_COMMIT', '22bf78c')  # the commit geo2b branched from
 GEO = {'E5': ('corrective', 'corrective'), 'E6': ('corrective', 'model_mix'), 'E7': ('corrective', 'fixed'),
-       'E8': ('noisy_fixed', 'fixed'), 'E9': ('noisy_resid', 'fixed')}
+       'E8': ('noisy_fixed', 'fixed'), 'E9': ('noisy_resid', 'fixed'),
+       'E10': ('noisy_fixed', 'model_mix'), 'E11': ('noisy_resid', 'model_mix')}
 NEW_KEYS = ['critic/oov_label', 'critic/oov_rollin', 'critic/model_used_frac', 'critic/model_clamp_frac',
             'critic/label_mean_bias', 'critic/target_clip_frac', 'critic/target_u_mean', 'critic/readout_oor_frac']
 
@@ -95,7 +96,7 @@ def test_geo_shapes_run_every_phase(variant, runs):
             for k in NEW_KEYS:
                 assert np.isfinite(x[k]), k
             assert x['critic/oov_label'] == 0 and x['critic/oov_rollin'] == 0, x
-            if variant == 'E6':
+            if GEO[variant][1] == 'model_mix':
                 assert 0.3 < x['critic/model_used_frac'] < 0.7, x
             else:
                 assert x['critic/model_used_frac'] == 0, x
