@@ -28,6 +28,16 @@ def geo_config_errors(config):
     if vocab not in VOCABS or label not in GEO1_LABELS + geo_codes.LABEL_MODES or rollin not in ROLLINS:
         return [f'unknown arb_vocab={vocab} / arb_label={label} / arb_rollin={rollin}']
     errors = []
+    if get('arb_readout', None) == 'sample_mean':
+        # geo3c: integer target grids. BSC: u = k / K_den (discount 1); QC-better: u = k / QC_K_DEN, gamma 0.99,
+        # ONE actor next chunk (critic_target_bon=False).
+        if get('arb_value', 'bsc') == 'qc':
+            if abs(get('discount', None) - (1 - 1 / QC_SCALE)) > 1e-9 or get('critic_target_bon', None) \
+                    or get('use_mc_target', False) or get('arb_length', None) != geo_codes.LENGTH:
+                errors.append('arb_value=qc with arb_readout=sample_mean needs discount=0.99, '
+                              'critic_target_bon=False, use_mc_target=False and arb_length=3')
+        elif get('discount', None) != 1.0 and not get('use_mc_target', False):
+            errors.append('arb_value=bsc with arb_readout=sample_mean needs discount=1 (integer grid)')
     if vocab == 'ordinary':
         if label in geo_codes.LABEL_MODES or rollin != 'canonical':
             errors.append(f'arb_label={label} arb_rollin={rollin} needs arb_vocab=redundant')
@@ -35,8 +45,8 @@ def geo_config_errors(config):
     if (label, rollin) not in GEO_COMBOS:
         errors.append(f'arb_vocab=redundant allows (arb_label, arb_rollin) in {sorted(GEO_COMBOS)}, '
                       f'got ({label}, {rollin})')
-    if get('arb_readout', None) != 'sample_mean' or get('arb_value', 'bsc') != 'bsc':
-        errors.append('arb_vocab=redundant needs arb_readout=sample_mean and arb_value=bsc')
+    if get('arb_readout', None) != 'sample_mean':
+        errors.append('arb_vocab=redundant needs arb_readout=sample_mean')
     if (get('arb_base', None), get('arb_length', None)) != (10, geo_codes.LENGTH):
         errors.append('arb_vocab=redundant needs arb_base=10 and arb_length=3')
     return errors
@@ -99,7 +109,10 @@ def ar_label_dists(k, k_den, base, length, mode):
     """
     first_soft = {'hard': length, 'twohot_last': length - 1, 'twohot_last2': length - 2, 'twohot_all': 0}[mode]
     k = jnp.asarray(k, jnp.int32)
-    d = ar_bin(k.astype(jnp.float32) / k_den, base, length)
+    # Integer digits: ar_bin's float snap would misplace k / k_den within 1e-3 code units of a code (QC_K_DEN);
+    # identical to ar_bin(k / k_den) on the BSC grids (k_den / B^L = num_qs M < 1000: fractional parts of
+    # k B^L / k_den are multiples of B^L / k_den, never within 1e-3 below a code).
+    d = canonical_digits(k, k_den, base, length)
     qs, clips = [], []
     for l in range(length):
         onehot = jax.nn.one_hot(d[..., l], base)
@@ -152,12 +165,54 @@ def ar_expected(critic_fn, observations, actions, base, length):
 QC_SCALE = 100.0
 
 
+# geo3c: label grid of the sampled-readout ARB-QC target, u = k / QC_K_DEN (= 50 x the 20000 readout grid of
+# 2 copies x 10 samples), independent of the readout's K_den. k in [0, QC_K_TOP]; QC_K_TOP / QC_K_DEN = 0.999.
+QC_K_DEN = 10 ** 6
+QC_K_TOP = QC_K_DEN - QC_K_DEN // 1000
+
+
 def u_to_raw(u):
     return QC_SCALE * u - QC_SCALE
 
 
 def raw_to_u(q):
     return (q + QC_SCALE) / QC_SCALE
+
+
+def qc_units(y, k_den=QC_K_DEN):
+    """Return-unit targets y (float32) -> (k, lo, hi): k = round(clip((y + 100) / 100, 0, 0.999) * k_den), int32,
+    rounding half to even, EXACT for the float32 value of y (no float rounding of the product); lo / hi: u < 0 /
+    u > 0.999 (clipped). Clipping u before or after rounding gives the same k (rounding is monotone and the clip
+    bounds are grid points).
+
+    (y + 100) * s, s = k_den / 100, is assembled in int32: y = t + f with t = trunc(y) and f = y - t (exact),
+    P = -f * 2^27 (an integer for every |y| >= 2^-4; smaller |y| has u > 0.999, clipped, so P's rounding there
+    is harmless), and P s / 2^27 by 14-bit limbs (s <= 10^5 keeps every product below 2^31)."""
+    s = k_den // 100
+    assert k_den % 1000 == 0 and s <= 10 ** 5, k_den
+    k_top = k_den - k_den // 1000
+    y = jnp.clip(jnp.asarray(y, jnp.float32), -101.0, 0.0)
+    t = jnp.trunc(y)
+    p = jnp.round((t - y) * 2.0 ** 27).astype(jnp.int32)  # in [0, 2^27]
+    a = (t.astype(jnp.int32) + 100) * s
+    t1 = (p >> 14) * s
+    f = (t1 & (2 ** 13 - 1)) * 2 ** 14 + (p & (2 ** 14 - 1)) * s  # numerator over 2^27 of the fractional part
+    whole = a - (t1 >> 13) - (f >> 27)                                # (y + 100) s = whole - (f mod 2^27) / 2^27
+    r2 = f & (2 ** 27 - 1)
+    n = whole - (r2 > 0).astype(jnp.int32)                            # floor
+    rem = jnp.where(r2 > 0, 2 ** 27 - r2, 0)                          # (y + 100) s = n + rem / 2^27
+    up = (rem > 2 ** 26) | ((rem == 2 ** 26) & (n % 2 == 1))
+    k = n + up.astype(jnp.int32)
+    lo = n < 0
+    hi = (n > k_top) | ((n == k_top) & (rem > 0))
+    return jnp.clip(k, 0, k_top), lo, hi
+
+
+def canonical_digits(k, k_den, base, length):
+    """Digits of floor(k B^L / k_den) (the canonical code of u = k / k_den), int32 exact; k_den divisible by B^L."""
+    n = jnp.clip(jnp.asarray(k, jnp.int32) // (k_den // base ** length), 0, base ** length - 1)
+    powers = base ** jnp.arange(length - 1, -1, -1, dtype=jnp.int32)
+    return (n[..., None] // powers) % base
 
 
 def _wmean(x, w):
@@ -217,6 +272,14 @@ class ACARBAgent(flax.struct.PyTreeNode):
         """K_den = B^L * num_qs * M: the sample_mean ensemble value is S / K_den."""
         return self.config['arb_base'] ** self.config['arb_length'] * self.config['num_qs'] * \
             self.config['arb_readout_samples']
+
+    def _qc_grid(self):
+        """geo3c: sampled-readout ARB-QC (arb_value='qc', arb_readout='sample_mean'): labels on QC_K_DEN."""
+        return self.config['arb_value'] == 'qc' and self.config['arb_readout'] == 'sample_mean'
+
+    def label_den(self):
+        """Denominator of the label grid u = k / label_den: QC_K_DEN for the sampled-readout ARB-QC, else K_den."""
+        return QC_K_DEN if self._qc_grid() else self.readout_den()
 
     def _percopy_critic(self, target, params=None):
         """Teacher-forced critic whose digits argument has a leading num_qs axis (one prefix per copy).
@@ -291,6 +354,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'success_frac': bsc_is_success.astype(jnp.float32).mean(),
             'timeout_frac': (bsc_is_terminal & ~bsc_is_success).astype(jnp.float32).mean(),
         }
+        if sample_mean and self.config['arb_value'] == 'qc':
+            return self._qc_sample_mean_target(batch, next_s, oor, info)
         if sample_mean:
             # Exact grid: every target is u = k / K_den, k int32 (success: k = K_den (1 - B^-L); timeout: 0;
             # non-terminal: S of the target readout, discount 1).
@@ -336,6 +401,24 @@ class ACARBAgent(flax.struct.PyTreeNode):
         # u = 1 is not representable in [0, 1); clip to the largest code.
         return target_q, jnp.clip(u, 0.0, 1.0 - B ** -L), info
 
+    def _qc_sample_mean_target(self, batch, next_s, oor, info):
+        """geo3c ARB-QC-better target: y = R + gamma^h m Qbar(s', a'), Qbar = 100 S' / K_den - 100 (return units),
+        R / m the chunk's discounted return / mask, h = horizon_length; u = clip((y + 100) / 100, 0, 0.999) on the
+        grid k / QC_K_DEN (qc_units). Returns (y, k / QC_K_DEN, info) with info['target_k'] = k."""
+        next_q = u_to_raw(next_s.astype(jnp.float32) / self.readout_den())
+        target_q = batch['rewards'][..., -1] + \
+            (self.config['discount'] ** self.config['horizon_length']) * batch['masks'][..., -1] * next_q
+        k, lo, hi = qc_units(jax.lax.stop_gradient(target_q), QC_K_DEN)
+        u = k.astype(jnp.float32) / QC_K_DEN
+        info['target_clip_hi_frac'] = hi.astype(jnp.float32).mean()
+        info['target_clip_lo_frac'] = lo.astype(jnp.float32).mean()
+        info['target_clip_frac'] = info['target_clip_hi_frac'] + info['target_clip_lo_frac']
+        info['readout_oor_frac'] = oor.mean()
+        info['target_k'] = k
+        info['target_u_mean'] = u.mean()
+        info['next_q_raw'] = next_q.mean()
+        return target_q, u, info
+
     def critic_ce(self, observations, actions, target_q, target_k, grad_params, rollin_rng, w):
         """Teacher-forced cross-entropy of the configured labels: (ce (num_qs, batch, L), logits, labels, info).
 
@@ -347,10 +430,12 @@ class ACARBAgent(flax.struct.PyTreeNode):
         if label_mode in geo_codes.LABEL_MODES:
             return self._geo_ce(observations, actions, target_k, grad_params, rollin_rng, w)
         info = {}
-        if label_mode == 'hard':
+        if label_mode == 'hard' and self._qc_grid():
+            labels = canonical_digits(target_k, QC_K_DEN, B, L)  # exact integer digits of k / QC_K_DEN
+        elif label_mode == 'hard':
             labels = ar_bin(target_q, B, L)  # (batch, L)
         else:
-            labels, label_q, label_clip = ar_label_dists(target_k, self.readout_den(), B, L, label_mode)
+            labels, label_q, label_clip = ar_label_dists(target_k, self.label_den(), B, L, label_mode)
 
         # Positional args only: nn.vmap (ensemblize) silently drops kwargs.
         logits = self.network.select('critic')(
@@ -391,7 +476,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
                 return geo_codes.class_to_token(jnp.argmax(logits / temp + gumbel, axis=-1).astype(jnp.int32))
 
         q, rollin, binfo = geo_codes.build(k, self.config['arb_label'], self.config['arb_rollin'], rollin_rng,
-                                           model_token, k_den=self.readout_den())
+                                           model_token, k_den=self.label_den())
         q, rollin = sg(q), sg(rollin)
         logits = self._percopy_critic(False, params=grad_params['modules_critic'])(
             observations, actions, to_classes(rollin))  # (num_qs, batch, L, 54)
@@ -401,7 +486,7 @@ class ACARBAgent(flax.struct.PyTreeNode):
         tokens = geo_codes.class_to_token(jnp.arange(geo_codes.NUM_CLASSES)).astype(jnp.float32)
         last = (q[..., -1, :] * tokens).sum(-1)
         prefix = geo_codes.decode_units(rollin.at[..., -1].set(0)).astype(jnp.float32)
-        bias = (prefix + last - k.astype(jnp.float32) / (self.readout_den() // 1000)) / 1000
+        bias = (prefix + last - k.astype(jnp.float32) / (self.label_den() // 1000)) / 1000
         n_model = num_qs * target_k.shape[0] * geo_codes.ROLLIN_POSITIONS
         info = {
             'oov_label': binfo['oov_label'].astype(jnp.float32),
@@ -410,6 +495,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'model_clamp_frac': binfo['model_clamp'].astype(jnp.float32) / jnp.maximum(binfo['model_used'], 1),
             'label_mean_bias': _wmean(bias, jnp.broadcast_to(w, bias.shape)),
         }
+        if self._qc_grid():
+            info['label_mean_bias_raw'] = QC_SCALE * info['label_mean_bias']  # return units
         return ce, logits, jnp.argmax(q, axis=-1), info
 
     def critic_loss(self, batch, grad_params, rng):
@@ -510,6 +597,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'bon_greedy_expected_gap': jnp.abs(cand_greedy - cand_expected).mean(),
             'q_readout': _wmean(q_readout, batch['valid'][..., -1]),
         }
+        if self._qc_grid():
+            info['q_readout_raw'] = u_to_raw(info['q_readout'])  # return units
         return {f'critic/{k}': v for k, v in info.items()}
 
     def _redundant_readout_diagnostics(self, observations, actions, greedy_q, wb, batch, rng):
@@ -532,6 +621,8 @@ class ACARBAgent(flax.struct.PyTreeNode):
             'bon_greedy_spread': (cand_greedy.max(-1) - cand_greedy.min(-1)).mean(),
             'q_readout': _wmean(q_readout, batch['valid'][..., -1]),
         }
+        if self._qc_grid():
+            info['q_readout_raw'] = u_to_raw(info['q_readout'])  # return units
         return {f'critic/{k}': v for k, v in info.items()}
 
     def actor_loss(self, batch, grad_params, rng):
@@ -749,9 +840,11 @@ class ACARBAgent(flax.struct.PyTreeNode):
             assert config['q_agg'] == 'mean', 'arb_readout=sample_mean needs q_agg=mean'
             k_den = config['arb_base'] ** config['arb_length'] * config['num_qs'] * config['arb_readout_samples']
             assert k_den * config['arb_base'] ** config['arb_length'] < 2 ** 31, 'int32 label arithmetic overflows'
+            if config['arb_value'] == 'qc':  # labels on QC_K_DEN: k B^L <= 999000 * 1000 < 2^31
+                assert QC_K_DEN * config['arb_base'] ** config['arb_length'] < 2 ** 31, 'int32 label arithmetic overflows'
         if label != 'hard':
-            assert config['arb_value'] == 'bsc' and config['arb_readout'] == 'sample_mean', \
-                f'arb_label={label} needs arb_value=bsc and arb_readout=sample_mean (integer target grid)'
+            assert config['arb_readout'] == 'sample_mean', \
+                f'arb_label={label} needs arb_readout=sample_mean (integer target grid)'
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
