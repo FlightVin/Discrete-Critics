@@ -98,7 +98,10 @@ def test_raw_u_inverse_and_cap():
     u = np.linspace(0, 0.999, 1001, dtype=np.float32)
     np.testing.assert_allclose(np.asarray(raw_to_u(u_to_raw(jnp.asarray(u)))), u, atol=1e-6)
     q = np.linspace(-100, -0.1, 1001, dtype=np.float32)
-    np.testing.assert_allclose(np.asarray(u_to_raw(raw_to_u(jnp.asarray(q)))), q, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(u_to_raw(raw_to_u(jnp.asarray(q)))), q, atol=2e-5)  # 2 ulp at 100
+    # Exact inverses as rational maps (the functions are plain arithmetic).
+    for x in (Fraction(0), Fraction(999, 1000), Fraction(12345, 10 ** 6), Fraction(1, 3)):
+        assert raw_to_u(u_to_raw(x)) == x and u_to_raw(raw_to_u(x - 100)) == x - 100
     # Largest decodable value: u = 0.999 -> Qhat = -0.1 (exactly in rationals; float32 within 1 ulp of 100).
     assert QC_K_TOP == 999_000 and Fraction(QC_K_TOP, QC_K_DEN) * 100 - 100 == Fraction(-1, 10)
     assert abs(float(u_to_raw(jnp.float32(0.999))) + 0.1) < 1e-5
