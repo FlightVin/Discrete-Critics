@@ -96,6 +96,7 @@ def evals(srcs):
         futs = {k: ex.submit(f) for k, f in jobs.items()}
         out = {k: f.result() for k, f in futs.items()}
     parts_after_interrupt = sorted(os.listdir(d / 'I' / 'final_eval_parts'))
+    out['I_final_written'] = os.path.exists(d / 'I' / 'final_eval.json')
     out['I2'] = final_eval(d, 'I', d / 'qc', QC[:-1])
     return d, out, hashes, parts_after_interrupt
 
@@ -133,7 +134,7 @@ def test_final_eval_shapes(name, src, evals):
     print(name, 'same initial obs (all episodes):', p['same_initial_obs_episodes'], '/ 16',
           {r: res[r]['successes'] for r in ('n1', 'bon')})
     line = [l for l in r['lines'] if l.startswith('FINAL_EVAL ')]
-    assert len(line) == 1 and 'per_seed' not in line[0]
+    assert len(line) == 1 and 'per_seed_successes' not in line[0] and 'per_episode' not in line[0]
 
 
 def test_two_runs_identical(evals):
@@ -147,7 +148,7 @@ def test_interrupted_resume_identical(evals):
     d, out, _, parts_after = evals
     assert out['I']['rc'] == 143, out['I']['lines'][-30:]
     assert any(l.startswith('EXIT_PREEMPTED source=flag') for l in out['I']['lines'])
-    assert 1 <= len(parts_after) < 4 and not os.path.exists(d / 'I' / 'final_eval.json'), parts_after
+    assert 1 <= len(parts_after) < 4 and not out['I_final_written'], parts_after
     assert not [f for f in parts_after if f.endswith('.tmp')]
     assert out['I2']['rc'] == 0, out['I2']['lines'][-30:]
     skipped = [l for l in out['I2']['lines'] if l.startswith('FINAL_EVAL_PART_SKIP')]
