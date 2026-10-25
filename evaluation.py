@@ -181,6 +181,7 @@ def evaluate_parallel(
     num_eval_envs,
     eval_episodes,
     action_dim,
+    return_episodes=False,
 ):
     """Evaluate the agent using a vectorized (parallel) environment.
 
@@ -190,18 +191,27 @@ def evaluate_parallel(
         num_eval_envs: Number of parallel environments.
         eval_episodes: Number of complete episodes to run per environment.
         action_dim: Per-step action dimension.
+        return_episodes: also return per-episode results (see Returns).
 
     Returns:
-        A tuple (stats, [], []) compatible with the sequential evaluate() signature.
+        A tuple (stats, [], []) compatible with the sequential evaluate() signature. With return_episodes:
+        (stats, [], [], episodes), episodes = dict of [num_eval_envs, eval_episodes] arrays: success (the
+        final info's 'success', as averaged in stats), length (env steps until done) and first_obs
+        ([..., obs_dim], the observation returned by reset).
     """
     total_episodes = num_eval_envs * eval_episodes
     actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
 
     stats = defaultdict(list)
     pbar = tqdm(total=total_episodes, desc="Parallel Eval", dynamic_ncols=True)
+    ep_success = np.zeros((num_eval_envs, eval_episodes))
+    ep_length = np.zeros((num_eval_envs, eval_episodes), dtype=np.int64)
+    first_obs = []
 
     for rollout_idx in range(eval_episodes):
         observations, _ = envs.reset()
+        if return_episodes:
+            first_obs.append(np.array(observations))
 
         action_queues = [[] for _ in range(num_eval_envs)]
         active_envs = np.ones(num_eval_envs, dtype=bool)
@@ -237,10 +247,13 @@ def evaluate_parallel(
 
             observations, rewards, terminations, truncations, infos = envs.step(np.array(step_actions))
             dones = np.logical_or(terminations, truncations)
+            ep_length[:, rollout_idx] += active_envs
 
             for i in range(num_eval_envs):
                 if active_envs[i] and dones[i]:
-                    add_to(stats, flatten_async(infos, i))
+                    info_i = flatten_async(infos, i)
+                    add_to(stats, info_i)
+                    ep_success[i, rollout_idx] = info_i.get('success', np.nan)
                     active_envs[i] = False
                     pbar.update(1)
 
@@ -249,4 +262,7 @@ def evaluate_parallel(
     for k, v in stats.items():
         stats[k] = np.mean(v)
 
+    if return_episodes:
+        episodes = dict(success=ep_success, length=ep_length, first_obs=np.stack(first_obs, axis=1))
+        return stats, [], [], episodes
     return stats, [], []
