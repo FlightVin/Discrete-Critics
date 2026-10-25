@@ -14,6 +14,13 @@
                  --method / --agent.* flags: restore only the agent from the source's committed checkpoint
                  (read-only), run the current-actor and fixed-candidate probes with the run's readout, write
                  <run_dir>/probe_ckpt.json. No env interaction, no training; W&B only with --project_name.
+  --mode=final_eval  --src_run_dir=<finished run> --run_dir=<out dir> plus the source run's --method / --agent.*
+                 / --env_name / --horizon_length flags (checked against its args.json and config row): the agent
+                 of the committed checkpoint (read-only, phase 'done' only), rules n1 and bon on --final_n_seeds
+                 env seeds (--final_seed_base + j) x --eval_episodes (default 4 in this mode) episodes, in chunks
+                 of --n_eval_envs; each (rule, chunk) is written to <run_dir>/final_eval_parts/ (a restart skips
+                 the parts present; a preemption notice exits 143 after the last complete part), then
+                 <run_dir>/final_eval.json. W&B only with --project_name.
   --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
                  --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
                  fresh optimisers; then phases
@@ -81,10 +88,12 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt'],
+flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
+                                      'final_eval'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
-                  'committed checkpoint of --src_run_dir (read-only).')
+                  'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
+                  'committed checkpoint of a finished --src_run_dir (read-only).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -112,7 +121,10 @@ flags.DEFINE_string('probe_candidates', None, 'npz from --mode=make_probe_candid
                     'probe states, scored at every probe (probe_fixed/*, probe_stab/*). None: off.')
 flags.DEFINE_enum('replay_rng', 'global', ['global', 'separate'], 'Replay sampling RNG: numpy global state (global) '
                   'or its own np.random.Generator(PCG64(seed + 1_000_003)), checkpointed (separate).')
-flags.DEFINE_string('src_run_dir', None, 'probe_ckpt: run directory whose committed checkpoint is probed (read-only).')
+flags.DEFINE_string('src_run_dir', None, 'probe_ckpt / final_eval: run directory whose committed checkpoint is '
+                    'probed / evaluated (read-only).')
+flags.DEFINE_integer('final_seed_base', 100000, 'final_eval: env seed j is final_seed_base + j.')
+flags.DEFINE_integer('final_n_seeds', 256, 'final_eval: env seeds (a multiple of --n_eval_envs).')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
 flags.DEFINE_integer('log_interval', 5000, 'Log interval (updates / env steps).')
 flags.DEFINE_float('ckpt_minutes', 20.0, 'Periodic checkpoint interval (minutes) at safe points.')
@@ -141,7 +153,7 @@ config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval', 'preempt_budget_s'}
 # Flags added after runs were started: left out of args.json at their default (older run dirs still resume).
 LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'replay_rng': 'global',
-                       'src_run_dir': None, 'out': None}
+                       'src_run_dir': None, 'out': None, 'final_seed_base': 100000, 'final_n_seeds': 256}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
@@ -1175,6 +1187,13 @@ class Trainer:
 def build_probe_trainer():
     """Trainer with config, demos, agent (actor from --init_actor if given) and probe states only: no eval
     envs, no replay, no checkpoint store, no W&B."""
+    tr = build_agent_trainer()
+    tr.setup_probe(tr.config)
+    return tr
+
+
+def build_agent_trainer():
+    """build_probe_trainer without the probe states."""
     tr = Trainer()
     # make_probe_candidates needs only the BC flow actor (same network in every agent): bsc's agent by default.
     method = FLAGS.method or ('bsc' if tr.mode == 'make_probe_candidates' else None)
@@ -1193,7 +1212,6 @@ def build_probe_trainer():
     if FLAGS.init_actor:
         agent, tr.init_actor_info = load_actor(agent, FLAGS.init_actor, tr.H)
     tr.agent = split_optimizer(agent)
-    tr.setup_probe(config)
     return tr
 
 
@@ -1257,6 +1275,206 @@ def probe_ckpt():
         wandb.finish()
 
 
+def wilson_ci(successes, n, z=1.959963984540054):
+    """Wilson score 95% interval of a binomial proportion."""
+    if n == 0:
+        return [None, None]
+    p = successes / n
+    den = 1 + z * z / n
+    mid = (p + z * z / (2 * n)) / den
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return [float(max(0.0, mid - half)), float(min(1.0, mid + half))]
+
+
+def refuse(msg):
+    print(f'FINAL_EVAL_REFUSED {msg}', flush=True)
+    sys.exit(2)
+
+
+def source_config_diff(src, src_args, config):
+    """{key: (source, this call)} for env_name / horizon_length / method (args.json), the resolved agent config
+    (the source's config row; agent keys added later are equal at their default) and the resolved QC entry."""
+    diff = {}
+    for k in ('env_name', 'horizon_length', 'method'):
+        if k in src_args and src_args[k] != FLAGS[k].value:
+            diff[k] = (src_args[k], FLAGS[k].value)
+    norm = lambda d: json.loads(json.dumps(strip_later_agent_defaults(d), default=str))  # noqa: E731
+    mine = norm(config.to_dict())
+    row = None
+    path = os.path.join(src, 'metrics.jsonl')
+    if os.path.exists(path):
+        with open(path) as f:
+            first = f.readline()
+        row = json.loads(first) if first.strip() else None
+    if row is not None and row.get('kind') == 'config':
+        theirs = norm(row['agent'])
+    else:  # no config row: the --agent flags of args.json (before create() filled in the shapes)
+        theirs = norm(src_args.get('agent', {}))
+        mine = {k: v for k, v in norm(FLAGS.agent.to_dict()).items() if k not in ('horizon_length', 'action_dim',
+                                                                                   'ob_dims')}
+        theirs = {k: v for k, v in theirs.items() if k not in ('horizon_length', 'action_dim', 'ob_dims')}
+    for k in sorted(set(mine) | set(theirs)):
+        if mine.get(k, '<absent>') != theirs.get(k, '<absent>'):
+            diff[f'agent.{k}'] = (theirs.get(k, '<absent>'), mine.get(k, '<absent>'))
+    resolved = json.loads(json.dumps(resolved_qc_args(config)))
+    if src_args.get('resolved_agent') != resolved:
+        diff['resolved_agent'] = (src_args.get('resolved_agent'), resolved)
+    return diff
+
+
+def final_eval_chunk_seed(c):
+    """numpy seed for chunk c (evaluate_parallel draws its JAX key from numpy): the same for both rules."""
+    return int(np.random.SeedSequence([FLAGS.final_seed_base, c]).generate_state(1)[0])
+
+
+def final_eval():
+    """--mode=final_eval: n1 and bon on the agent of --src_run_dir's committed checkpoint -> final_eval.json."""
+    assert FLAGS.src_run_dir, '--src_run_dir is required'
+    src, out_dir = os.path.realpath(FLAGS.src_run_dir), os.path.realpath(FLAGS.run_dir)
+    if src == out_dir or out_dir.startswith(src + os.sep):
+        refuse(f'--run_dir {out_dir} lies inside --src_run_dir {src}')
+    n_seeds, C = FLAGS.final_n_seeds, FLAGS.n_eval_envs
+    E = FLAGS.eval_episodes if FLAGS['eval_episodes'].present else 4
+    if n_seeds <= 0 or C <= 0 or n_seeds % C:
+        refuse(f'--final_n_seeds={n_seeds} is not a positive multiple of --n_eval_envs={C}')
+    state, man = read_committed_state(src)
+    if state['phase'] != 'done':
+        refuse(f'checkpoint gen={man["gen"]} of {src} has phase={state["phase"]} (need done)')
+    args_path = os.path.join(src, 'args.json')
+    if not os.path.exists(args_path):
+        refuse(f'{args_path} not found')
+    with open(args_path) as f:
+        src_args = json.load(f)
+
+    tr = build_agent_trainer()
+    try:
+        diff = source_config_diff(src, src_args, tr.config)
+        if diff:
+            refuse('config differs from the source run (source, this call): ' + json.dumps(diff, default=str))
+        tr.agent = flax.serialization.from_state_dict(tr.agent, state['agent'])
+        out = run_final_eval(tr, src, state, man, n_seeds, C, E)
+    except SystemExit:
+        raise
+    except BaseException:
+        exit_on_exception(tr)
+    if FLAGS['project_name'].present:
+        import wandb
+        import secrets
+        tr.wandb_id = secrets.token_hex(6)  # its own W&B run
+        tr.setup_wandb()
+        wandb.config.update(dict(v1=dict(mode='final_eval', src_run_dir=src, gen=man['gen'])), allow_val_change=True)
+        log = {}
+        for rule in ('n1', 'bon'):
+            r = out[rule]
+            log.update({f'final1024/{rule}_successes': r['successes'], f'final1024/{rule}_success_rate': r['success_rate'],
+                        f'final1024/{rule}_ci_lo': r['wilson95'][0], f'final1024/{rule}_ci_hi': r['wilson95'][1]})
+        log['final1024/bon_minus_n1_successes'] = out['paired']['bon_minus_n1_successes']
+        log['final1024/bon_minus_n1_rate'] = out['bon']['success_rate'] - out['n1']['success_rate']
+        wandb.log(log)
+        wandb.finish()
+
+
+def run_final_eval(tr, src, state, man, n_seeds, C, E):
+    import functools
+    parts_dir = os.path.join(FLAGS.run_dir, 'final_eval_parts')
+    os.makedirs(parts_dir, exist_ok=True)
+    tr.eval_envs = None  # built before the first part to evaluate (none if every part is on disk)
+    action_dim = tr.config['action_dim']
+    n_chunks = n_seeds // C
+    ident = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, n_eval_envs=C,
+                 eval_episodes=E)
+    parts, done = {}, 0
+
+    def exit_preempted():
+        tr.close_envs()
+        dt = time.time() - tr.t_stop_ref
+        print(f'EXIT_PREEMPTED source={tr.stop_source} notice_to_exit_s={dt:.2f} phase=final_eval '
+              f'parts_done={done}', flush=True)
+        sys.exit(EXIT_PREEMPTED)
+
+    for rule in ('n1', 'bon'):
+        fn = n1_actions if rule == 'n1' else bon_actions
+        for c in range(n_chunks):
+            path = os.path.join(parts_dir, f'{rule}_{c}.json')
+            seeds = [FLAGS.final_seed_base + c * C + i for i in range(C)]
+            if os.path.exists(path):
+                with open(path) as f:
+                    part = json.load(f)
+                if {k: part.get(k) for k in ident} != ident or part['seeds'] != seeds:
+                    tr.close_envs()
+                    refuse(f'{path} was written with other settings: '
+                           + json.dumps({k: part.get(k) for k in ident}))
+                print(f'FINAL_EVAL_PART_SKIP rule={rule} chunk={c}', flush=True)
+                parts[rule, c] = part
+                done += 1
+                continue
+            if tr.watcher is not None:
+                tr.watcher.check()
+            if tr.stop_requested:
+                exit_preempted()
+            if tr.eval_envs is None:
+                np_state = np.random.get_state()  # robomimic's make_env reseeds numpy (as in setup)
+                tr.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, C, seed=FLAGS.final_seed_base)
+                np.random.set_state(np_state)
+            t0 = time.time()
+
+            def act(observations, rng, fn=fn):
+                if tr.stop_requested:
+                    raise EvalAborted()
+                return fn(tr.agent, observations, rng)
+
+            tr.eval_envs.set_attr('v1_reseed', [functools.partial(_seed_numpy, s) for s in seeds])
+            tr.eval_envs.call('v1_reseed')
+            np.random.seed(final_eval_chunk_seed(c))
+            try:
+                _, _, _, eps = evaluate_parallel(agent=Policy(act), envs=tr.eval_envs, num_eval_envs=C,
+                                                 eval_episodes=E, action_dim=action_dim, return_episodes=True)
+            except EvalAborted:
+                print(f'EVAL_ABORTED ({tr.stop_source}) rule={rule} chunk={c}', flush=True)
+                exit_preempted()
+            digest = [[hashlib.sha256(np.ascontiguousarray(o, dtype=np.float64).tobytes()).hexdigest()[:16]
+                       for o in env_obs] for env_obs in eps['first_obs']]
+            part = dict(ident, rule=rule, chunk=c, seeds=seeds, success=eps['success'].astype(int).tolist(),
+                        length=eps['length'].tolist(), first_obs_digest=digest, wall_s=time.time() - t0)
+            write_atomic(path, (json.dumps(part) + '\n').encode())
+            parts[rule, c] = part
+            done += 1
+            print(f'FINAL_EVAL_PART rule={rule} chunk={c} successes={int(np.sum(part["success"]))}/{C * E} '
+                  f'wall_s={part["wall_s"]:.1f}', flush=True)
+    tr.close_envs()
+
+    ctr = dict(state['ctr'])
+    out = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], mode=state.get('mode'), ctr=ctr,
+               step=int(ctr.get('env_steps', 0) or ctr.get('bc_updates', 0)), env_name=FLAGS.env_name,
+               horizon_length=FLAGS.horizon_length, method=FLAGS.method, agent_name=tr.config['agent_name'],
+               agent=strip_later_agent_defaults(tr.config.to_dict()), final_seed_base=FLAGS.final_seed_base,
+               seeds=[FLAGS.final_seed_base + j for j in range(n_seeds)], n_eval_envs=C, eval_episodes=E,
+               wall_s=float(sum(p['wall_s'] for p in parts.values())))
+    per_seed, digests = {}, {}
+    for rule in ('n1', 'bon'):
+        S = np.concatenate([np.asarray(parts[rule, c]['success'], dtype=np.int64) for c in range(n_chunks)])
+        L = np.concatenate([np.asarray(parts[rule, c]['length'], dtype=np.int64) for c in range(n_chunks)])
+        digests[rule] = sum((parts[rule, c]['first_obs_digest'] for c in range(n_chunks)), [])
+        k, n = int(S.sum()), int(S.size)
+        per_seed[rule] = S.sum(1)
+        out[rule] = dict(successes=k, episodes=n, success_rate=k / n, wilson95=wilson_ci(k, n),
+                         per_seed_successes=per_seed[rule].tolist(), per_episode_success=S.tolist(),
+                         per_episode_length=L.tolist(),
+                         mean_success_length=float(L[S == 1].mean()) if k else None)
+    d = per_seed['bon'] - per_seed['n1']
+    same = np.array(digests['n1']) == np.array(digests['bon'])
+    out['paired'] = dict(bon_minus_n1_successes=int(d.sum()), per_seed_diff_mean=float(d.mean()),
+                         per_seed_diff_sd=float(d.std(ddof=1)) if len(d) > 1 else None,
+                         same_first_obs_seeds=int(same[:, 0].sum()), same_initial_obs_episodes=int(same.sum()))
+    write_atomic(os.path.join(FLAGS.run_dir, 'final_eval.json'),
+                 (json.dumps(out, indent=1, default=str) + '\n').encode())
+    summary = {k: v for k, v in out.items() if k not in ('agent', 'seeds', 'n1', 'bon', 'ctr')}
+    for rule in ('n1', 'bon'):
+        summary[rule] = {k: v for k, v in out[rule].items() if not k.startswith('per_')}
+    print('FINAL_EVAL ' + json.dumps(summary, default=str), flush=True)
+    return out
+
+
 def main(_):
     assert FLAGS.run_dir or FLAGS.mode == 'make_probe_candidates', '--run_dir is required'
     if FLAGS.mode == 'make_probe_candidates':
@@ -1264,6 +1482,9 @@ def main(_):
         return
     if FLAGS.mode == 'probe_ckpt':
         probe_ckpt()
+        return
+    if FLAGS.mode == 'final_eval':
+        final_eval()
         return
     if FLAGS.mode == 'eval_actor':
         assert FLAGS.init_actor, '--init_actor is required for --mode=eval_actor'
