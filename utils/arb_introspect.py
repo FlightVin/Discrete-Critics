@@ -151,7 +151,7 @@ def reference_digits(u_ref, se_u=None, z=Z_DECIDE):
 
 
 # ---- forced-prefix recovery (7A) -----------------------------------------------------------------------------
-def forced_recovery(agent, obs, act, key, u_ref, se_u=None, offsets=OFFSETS):
+def forced_recovery(agent, obs, act, key, u_ref, se_u=None, offsets=OFFSETS, ablate=False, prefixes=None):
     """Section 7A. Reference digits c = canonical digits of u_ref. For position p in {1, 2} and e in `offsets`:
     position p forced to c_p + e (positions before p forced to the reference digits), later positions by the
     production readout with the same noise key for every (p, e). Unsupported (forced token outside the vocabulary:
@@ -162,37 +162,45 @@ def forced_recovery(agent, obs, act, key, u_ref, se_u=None, offsets=OFFSETS):
     recov_<tol> = P(|clip(n)/1000 - u_ref| <= tol) over copies x samples; at the next position p + 1 (prefix is
     fixed there, so p(z | prefix) is exact): r = required residual (u_ref * 1000 - prefix units) / w_{p+1},
     tok_mean_err = E_p[token] - r, corrective_mass = p(|token - r| <= 1) (tokens bringing the decoded value back
-    within one unit of position p + 1). digit_ok: reference digits decidable at positions 1..p+1; summaries of
-    tok_mean_err / corrective_mass use digit_ok queries only, value metrics use all supported queries."""
+    within one unit of position p + 1), exact_mass = p(token == r) (r integral: exact reference codes),
+    exact_code_frac = P(n == round(1000 u_ref)). digit_ok: reference digits decidable at positions 1..p+1;
+    summaries of tok_mean_err / corrective_mass use digit_ok queries only, value metrics all supported queries.
+    prefixes: optional {name: (p, (delta_1, .., delta_p))} forcing positions 1..p to c + delta (e.g. alternative
+    redundant encodings of the reference code) instead of the (p, e) grid. ablate: the readout of the later
+    positions masks tokens < 0 or > 9 (correction ablation)."""
     nc, lo, hi = vocab(agent)
     u_ref = np.asarray(u_ref, np.float64)
     ref, dec = reference_digits(u_ref, se_u)
     tok = np.asarray(class_tokens(agent), np.float64)
+    if prefixes is None:
+        prefixes = {f'p{p}_e{e:+d}': (p, (0,) * (p - 1) + (e,)) for p in (1, 2) for e in offsets}
     out = {}
-    for p in (1, 2):
-        for e in offsets:
-            forced_t = ref.copy()
-            forced_t[:, p - 1] += e
-            supported = (forced_t[:, :p] >= lo).all(-1) & (forced_t[:, :p] <= hi).all(-1)
-            cls = np.where(supported[:, None], forced_t - lo, 0).astype(np.int32)  # dummy class: rows dropped
-            tr = trace(agent, obs, act, key, cls, tuple(range(p)))
-            n = np.asarray(tr['n'])                              # (num_qs, Q, M)
-            vals = np.clip(n, 0, 999) / 1000.0
-            value = vals.mean(axis=(0, 2))
-            pre = (forced_t * UNIT_W).sum(-1) / 1000.0           # later positions at the reference digits
-            r = (u_ref * 1000 - (forced_t[:, :p] * UNIT_W[:p]).sum(-1)) / UNIT_W[p]
-            probs = np.asarray(tr['probs'])[..., 0, p, :].mean(0)  # (Q, C): same prefix for every sample
-            tmean = (probs * tok).sum(-1)
-            mass = (probs * (np.abs(tok[None] - r[:, None]) <= 1)).sum(-1)
-            nan = lambda x: np.where(supported, x, np.nan)  # noqa: E731
-            res = dict(supported=supported, digit_ok=supported & dec[:, :p + 1].all(-1),
-                       value=nan(value), err=nan(value - u_ref), err_prefix=nan(pre - u_ref),
-                       removed=nan(np.abs(pre - u_ref) - np.abs(value - u_ref)), r=nan(r),
-                       tok_mean_err=nan(tmean - r), corrective_mass=nan(mass),
-                       tokens=np.where(supported[None, :, None, None], np.asarray(tr['tokens']), 0))
-            for t in TOLS:
-                res[f'recov_{t}'] = nan((np.abs(vals - u_ref[None, :, None]) <= t).mean(axis=(0, 2)))
-            out[f'p{p}_e{e:+d}'] = res
+    code = np.round(u_ref * 1000).astype(np.int64)
+    for name, (p, deltas) in prefixes.items():
+        forced_t = ref.copy()
+        forced_t[:, :p] += np.asarray(deltas, np.int64)
+        supported = (forced_t[:, :p] >= lo).all(-1) & (forced_t[:, :p] <= hi).all(-1)
+        cls = np.where(supported[:, None], forced_t - lo, 0).astype(np.int32)  # dummy class: rows dropped
+        tr = trace(agent, obs, act, key, cls, tuple(range(p)), ablate=ablate)
+        n = np.asarray(tr['n'])                              # (num_qs, Q, M)
+        vals = np.clip(n, 0, 999) / 1000.0
+        value = vals.mean(axis=(0, 2))
+        pre = (forced_t * UNIT_W).sum(-1) / 1000.0           # later positions at the reference digits
+        r = (u_ref * 1000 - (forced_t[:, :p] * UNIT_W[:p]).sum(-1)) / UNIT_W[p]
+        probs = np.asarray(tr['probs'])[..., 0, p, :].mean(0)  # (Q, C): same prefix for every sample
+        tmean = (probs * tok).sum(-1)
+        mass = (probs * (np.abs(tok[None] - r[:, None]) <= 1)).sum(-1)
+        exact = (probs * (np.abs(tok[None] - r[:, None]) < 1e-6)).sum(-1)
+        nan = lambda x: np.where(supported, x, np.nan)  # noqa: E731
+        res = dict(supported=supported, digit_ok=supported & dec[:, :p + 1].all(-1),
+                   value=nan(value), err=nan(value - u_ref), err_prefix=nan(pre - u_ref),
+                   removed=nan(np.abs(pre - u_ref) - np.abs(value - u_ref)), r=nan(r),
+                   tok_mean_err=nan(tmean - r), corrective_mass=nan(mass), exact_mass=nan(exact),
+                   exact_code_frac=nan((n == code[None, :, None]).mean(axis=(0, 2))),
+                   tokens=np.where(supported[None, :, None, None], np.asarray(tr['tokens']), 0))
+        for t in TOLS:
+            res[f'recov_{t}'] = nan((np.abs(vals - u_ref[None, :, None]) <= t).mean(axis=(0, 2)))
+        out[name] = res
     return out
 
 
@@ -208,7 +216,8 @@ def forced_summary(agent, fr):
                  err_prefix_mean=m(r['err_prefix'], sup), abs_err_prefix_mean=m(np.abs(r['err_prefix']), sup),
                  removed_mean=m(r['removed'], sup),
                  tok_mean_err=m(r['tok_mean_err'], ok), abs_tok_mean_err=m(np.abs(r['tok_mean_err']), ok),
-                 corrective_mass=m(r['corrective_mass'], ok))
+                 corrective_mass=m(r['corrective_mass'], ok), exact_mass=m(r['exact_mass'], ok),
+                 exact_code_frac=m(r['exact_code_frac'], sup))
         for t in TOLS:
             d[f'recov_{t}'] = m(r[f'recov_{t}'], sup)
         if raw and d['abs_err_mean'] is not None:
@@ -318,21 +327,33 @@ def dist_stats(q, logp, qstar, r, tok):
 def label_fit(agent, batch, key, clean_u=None):
     """Section 8 on a panel batch (replay format). key is split as critic_loss splits its rng:
     (_, sample_rng, readout_rng, rollin_rng) = split(key, 4); the TD target is agent.td_target (frozen target
-    critic, the agent's own code); labels by method_labels (= critic_ce). The model readout for (b) uses
-    fold_in(key, 5).
-
-    (a) target-derived prefixes: the method's roll-in; (b) model-generated prefixes: the production readout's
-    sampled prefixes (num_qs x M per query); the method's q under them (redundant: label_and_info on the actual
-    prefix; ordinary: prefix-independent canonical-digit labels). q*: corrective two-hot of the target k given
-    the prefix. Returns per-query / per-position arrays: <a|b>_<stat> (Q, L) averaged over copies (and samples),
-    y_u (Q,), tf_value (Q,) = dec(target-derived prefix) + w_L E_p[z_L], readout_value (Q,), clean_u."""
+    critic, the agent's own code); labels by method_labels (= critic_ce); then label_fit_k with readout key
+    fold_in(key, 5). Adds y (method units) and clean_u."""
     c = agent.config
     actions = batch['actions']
     act = jnp.reshape(actions, (actions.shape[0], -1)) if c['action_chunking'] else actions[..., 0, :]
-    obs = batch['observations']
     _, sample_rng, readout_rng, rollin_rng = jax.random.split(key, 4)
     y, u, info = agent.td_target(batch, sample_rng, readout_rng)
-    target_k = info.get('target_k')
+    out = label_fit_k(agent, batch['observations'], act, u, info.get('target_k'), rollin_rng,
+                      jax.random.fold_in(key, 5))
+    out['y'] = np.asarray(y)
+    if clean_u is not None:
+        out['clean_u'] = np.asarray(clean_u, np.float64)
+    return out
+
+
+def label_fit_k(agent, obs, act, u, target_k, rollin_rng, readout_key, ablate=False):
+    """Label-objective fit for targets u / target_k (target_k None: k = round(u 10^6) on 10^6 for q*).
+
+    (a) target-derived prefixes: the method's roll-in (method_labels, key rollin_rng); (b) model-generated prefixes:
+    the production readout's sampled prefixes (num_qs x M per query, key readout_key; ablate: the correction
+    ablation's prefixes); the method's q under them (redundant: label_and_info on the actual prefix; ordinary:
+    prefix-independent canonical-digit labels). q*: clean corrective two-hot of the target k given the prefix.
+    Returns per-position arrays (Q, L) averaged over copies (and samples): <a|b>_{ce, h, kl, kl_star,
+    tok_mean_err, clean_mass, qstar_oov_mass}, a_tf_acc (argmax p == argmax q), b_token_ok (sampled token in
+    supp q*(its own prefix)); per query: y_u, tf_value = dec(target-derived prefix) + w_L E_p[z_L], readout_value,
+    exact_code_frac (sampled codes equal to round(1000 y_u))."""
+    c = agent.config
     nc, lo, _ = vocab(agent)
     tok = class_tokens(agent).astype(jnp.float32)
     if target_k is not None:
@@ -347,11 +368,12 @@ def label_fit(agent, batch, key, clean_u=None):
     qstar, r, oov = corrective_twohot(kb, k_den, prefix_tok, lo, nc)
     a = dist_stats(q, logp, qstar, r, tok)
     a['qstar_oov_mass'] = oov
+    a['tf_acc'] = (jnp.argmax(logp, -1) == jnp.argmax(q, -1)).astype(jnp.float32)
     w = jnp.asarray(POS_SCALE, jnp.float32)
     prefix_u = (geo_codes._prefix_units(prefix_tok, 2)).astype(jnp.float32) / 1000
     tf_value = (prefix_u + w[2] * (jnp.exp(logp[..., 2, :]) * tok).sum(-1)).mean(0)
 
-    tr = trace(agent, obs, act, jax.random.fold_in(key, 5))
+    tr = trace(agent, obs, act, readout_key, ablate=ablate)
     mp = tr['tokens']                                            # (num_qs, Q, M, L)
     km = jnp.broadcast_to(k[None, :, None], mp.shape[:-1])
     label_mode = c['arb_label'] if 'arb_label' in c else 'hard'
@@ -363,12 +385,12 @@ def label_fit(agent, batch, key, clean_u=None):
     logp_b = jnp.log(jnp.maximum(tr['probs'], 1e-38))
     b = dist_stats(qb, logp_b, qstar_b, r_b, tok)
     b['qstar_oov_mass'] = oov_b
+    b['token_ok'] = (jnp.take_along_axis(qstar_b, (mp - lo)[..., None], -1)[..., 0] > 0).astype(jnp.float32)
+    code = jnp.round(y_u * 1000).astype(jnp.int32)
     out = {f'a_{n}': np.asarray(v.mean(0)) for n, v in a.items()}
     out.update({f'b_{n}': np.asarray(v.mean((0, 2))) for n, v in b.items()})
-    out.update(y=np.asarray(y), y_u=np.asarray(y_u), tf_value=np.asarray(tf_value),
-               readout_value=np.asarray(tr['value']), label_mode=label_mode)
-    if clean_u is not None:
-        out['clean_u'] = np.asarray(clean_u, np.float64)
+    out.update(y_u=np.asarray(y_u), tf_value=np.asarray(tf_value), readout_value=np.asarray(tr['value']),
+               exact_code_frac=np.asarray((tr['n'] == code[None, :, None]).mean((0, 2))), label_mode=label_mode)
     return out
 
 
