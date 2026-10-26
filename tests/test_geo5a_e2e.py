@@ -63,7 +63,7 @@ def outs(src):
     out = {}
 
     def stage(jobs):
-        with ThreadPoolExecutor(min(3, len(jobs))) as ex:
+        with ThreadPoolExecutor(min(2, len(jobs))) as ex:  # 2: modest memory (the job's cgroup is shared)
             futs = {k: ex.submit(f) for k, f in jobs.items()}
             out.update({k: f.result() for k, f in futs.items()})
 
