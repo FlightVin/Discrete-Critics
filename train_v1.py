@@ -89,12 +89,14 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
-                                      'final_eval', 'arb_introspect'],
+                                      'final_eval', 'arb_introspect', 'diag_anchors', 'diag_mc', 'diag_score',
+                                      'diag_select'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
                   'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
                   'committed checkpoint of a finished --src_run_dir (read-only); arb_introspect: AR-B critic '
-                  'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b).')
+                  'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b); '
+                  'diag_*: geo5a diagnostics of a finished --src_run_dir (read-only), see diag_main.')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -127,7 +129,8 @@ flags.DEFINE_string('src_run_dir', None, 'probe_ckpt / final_eval: run directory
 flags.DEFINE_integer('final_seed_base', 100000, 'final_eval: env seed j is final_seed_base + j.')
 flags.DEFINE_integer('final_n_seeds', 256, 'final_eval: env seeds (a multiple of --n_eval_envs).')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
-flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py).')
+flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py); diag_mc / diag_score: '
+                    'query file (anchors.pkl or select_queries.pkl); diag_select: the common-panel anchors.pkl.')
 flags.DEFINE_string('candidates', None, 'arb_introspect: optional candidate-set npz (observations, candidates).')
 flags.DEFINE_integer('introspect_seed', 0, 'arb_introspect: base PRNG seed of the readout noise.')
 flags.DEFINE_integer('introspect_chunk', 256, 'arb_introspect: queries per resumable part.')
@@ -137,6 +140,25 @@ flags.DEFINE_integer('log_interval', 5000, 'Log interval (updates / env steps).'
 flags.DEFINE_float('ckpt_minutes', 20.0, 'Periodic checkpoint interval (minutes) at safe points.')
 flags.DEFINE_float('preempt_budget_s', 60.0, 'After a preemption notice: if no safe point has been reached '
                    'this many seconds after it, exit without a new checkpoint (resume from the last one).')
+
+flags.DEFINE_integer('diag_seed', 0, 'diag_anchors: actor RNG of the diagnostic replays.')
+flags.DEFINE_enum('diag_rule', 'n1', ['n1', 'bo32'], 'diag_anchors: action rule of the diagnostic replays.')
+flags.DEFINE_integer('diag_n_seeds', 32, 'diag_anchors: env seeds final_seed_base + j, j < this.')
+flags.DEFINE_integer('diag_episodes', 4, 'diag_anchors: episodes per env seed (as final_eval).')
+flags.DEFINE_integer('anchors', 32, 'diag_anchors: anchors selected by the stratified rule.')
+flags.DEFINE_string('policy_ckpt', None, 'diag_anchors: actor pkl (selected BC actor) instead of --src_run_dir: '
+                    'the common-state panel (n1, no critic).')
+flags.DEFINE_integer('mc_k', 32, 'diag_mc: continuations per query.')
+flags.DEFINE_integer('mc_seed', 0, 'diag_mc: RNG of the continuations.')
+flags.DEFINE_integer('mc_t_extra', 757, 'diag_mc (QC contract): steps summed past the step limit (100 * 0.99^757 '
+                     '= 0.0497 return units tail bound).')
+flags.DEFINE_integer('mc_part_size', 8, 'diag_mc: queries per output part.')
+flags.DEFINE_enum('continuation', 'n1', ['n1', 'bo32'], 'diag_mc: continuation policy (bo32: labelled option).')
+flags.DEFINE_enum('diag_contract', 'auto', ['auto', 'bsc', 'qc'], 'diag_mc: value contract (auto: the critic\'s).')
+flags.DEFINE_integer('sel_seed', 0, 'diag_select: candidate noise / uniform-index / subset RNG.')
+flags.DEFINE_integer('mc_candidates', 0, 'diag_select: also this many further candidates (fixed subset incl. the '
+                     'chosen one) as queries.')
+flags.DEFINE_integer('score_keys', 5, 'diag_score: extra readout keys (variability) for sampled readouts.')
 
 flags.DEFINE_string('project_name', 'qc', 'W&B project.')
 flags.DEFINE_string('run_group', 'v1', 'W&B group.')
@@ -162,7 +184,11 @@ RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name',
 LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'replay_rng': 'global',
                        'src_run_dir': None, 'out': None, 'final_seed_base': 100000, 'final_n_seeds': 256,
                        'queries': None, 'candidates': None, 'introspect_seed': 0, 'introspect_chunk': 256,
-                       'introspect_components': ['trace', 'forced', 'ablation', 'candidates', 'labelfit']}
+                       'introspect_components': ['trace', 'forced', 'ablation', 'candidates', 'labelfit'],
+                       'diag_seed': 0, 'diag_rule': 'n1', 'diag_n_seeds': 32, 'diag_episodes': 4, 'anchors': 32,
+                       'policy_ckpt': None, 'mc_k': 32, 'mc_seed': 0, 'mc_t_extra': 757,
+                       'mc_part_size': 8, 'continuation': 'n1', 'diag_contract': 'auto', 'sel_seed': 0,
+                       'mc_candidates': 0, 'score_keys': 5}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
@@ -1207,8 +1233,10 @@ def build_probe_trainer():
 def build_agent_trainer():
     """build_probe_trainer without the probe states."""
     tr = Trainer()
-    # make_probe_candidates needs only the BC flow actor (same network in every agent): bsc's agent by default.
-    method = FLAGS.method or ('bsc' if tr.mode == 'make_probe_candidates' else None)
+    # make_probe_candidates and the diag_anchors common panel (--policy_ckpt) need only the BC flow actor (same
+    # network in every agent): bsc's agent by default.
+    actor_only = tr.mode == 'make_probe_candidates' or (tr.mode == 'diag_anchors' and FLAGS.policy_ckpt)
+    method = FLAGS.method or ('bsc' if actor_only else None)
     config = resolve_agent_config(method, FLAGS.agent, sys.argv)
     config['horizon_length'] = FLAGS.horizon_length
     check_agent_config(tr.mode, config)
@@ -1521,6 +1549,509 @@ def arb_introspect():
                 seed=FLAGS.introspect_seed, components=tuple(FLAGS.introspect_components))
 
 
+# ---- geo5a diagnostics (--mode=diag_*) ------------------------------------------------------------------------
+# All modes read the source run read-only (as final_eval: committed checkpoint, phase 'done', the call's --method /
+# --agent.* / --env_name / --horizon_length checked against it) and write only below --run_dir (refused inside the
+# source): manifest.json (inputs, hashes, seeds, counts, code sha per start), atomic parts (a restart skips the
+# finished ones; a preemption notice exits 143 after the last finished part), then the mode's outputs.
+#   diag_anchors  diagnostic replays (NOT the official final_eval trajectories): --diag_n_seeds env seeds
+#                 final_seed_base + j x --diag_episodes episodes (initial states as final_eval), rule --diag_rule
+#                 with actor keys from --diag_seed; per decision: seed, episode, step, snapshot, executed chunk,
+#                 critic score of the chunk (production readout, key PRNGKey(0)), episode success / length
+#                 (parts/replay_<c>.pkl). Then --anchors anchors by diag_v1.select_anchors -> anchors.pkl (a query
+#                 file: the anchor states and their executed chunks), anchors.json. --policy_ckpt=<actor pkl>
+#                 instead of --src_run_dir: the common-state panel (n1, no critic).
+#   diag_mc       per query of --queries: --mc_k continuations: restore -> execute the query chunk -> --continuation
+#                 (n1 default) of the source actor; actor key fold_in(fold_in(PRNGKey(mc_seed), q), k), env numpy
+#                 seed SeedSequence([mc_seed, q, k]); contract (bsc / qc, diag_v1.ReturnAccumulator) from the critic
+#                 -> parts/mc_<p>.pkl, mc.json (per query: every G_k, mean, SE).
+#   diag_score    per query: production score / value of the source critic with key PRNGKey(0) and --score_keys
+#                 more keys (sampled readouts; scalar critics: one) -> scores.json.
+#   diag_select   per state of the panel --queries: actor_num_samples candidates of the source actor (noise key
+#                 from SeedSequence([sel_seed, state])), the critic's choice (production score, key PRNGKey(0), first
+#                 index on ties), a uniform index (own RNG), optionally --mc_candidates further candidates
+#                 -> select.json, select_queries.pkl (input of diag_mc / diag_score).
+SCORE_SEED = 20261025
+DIAG_QUERY_VERSION = 1
+
+
+def diag_refuse(msg):
+    print(f'DIAG_REFUSED {msg}', flush=True)
+    sys.exit(2)
+
+
+def code_version():
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        sha = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True,
+                             timeout=30).stdout.strip()
+        dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=repo,
+                               capture_output=True, text=True, timeout=30).stdout.strip()
+        return dict(sha=sha or None, dirty=bool(dirty))
+    except Exception as e:  # no git: still run
+        return dict(sha=None, error=repr(e))
+
+
+def _check_out_dir(src):
+    out_dir = os.path.realpath(FLAGS.run_dir)
+    if src == out_dir or out_dir.startswith(src + os.sep):
+        diag_refuse(f'--run_dir {out_dir} lies inside the source {src}')
+
+
+def diag_frozen_agent():
+    """(trainer with the source checkpoint's agent, source info); the source is only read."""
+    if not FLAGS.src_run_dir:
+        diag_refuse('--src_run_dir is required')
+    src = os.path.realpath(FLAGS.src_run_dir)
+    _check_out_dir(src)
+    state, man = read_committed_state(src)
+    if state['phase'] != 'done':
+        diag_refuse(f'checkpoint gen={man["gen"]} of {src} has phase={state["phase"]} (need done)')
+    args_path = os.path.join(src, 'args.json')
+    if not os.path.exists(args_path):
+        diag_refuse(f'{args_path} not found')
+    with open(args_path) as f:
+        src_args = json.load(f)
+    tr = build_agent_trainer()
+    diff = source_config_diff(src, src_args, tr.config)
+    if diff:
+        diag_refuse('config differs from the source run (source, this call): ' + json.dumps(diff, default=str))
+    tr.agent = flax.serialization.from_state_dict(tr.agent, state['agent'])
+    info = dict(kind='checkpoint', src_run_dir=src, gen=man['gen'], phase=state['phase'],
+                state_sha256=man['files']['state.pkl']['sha256'], args_sha256=file_sha256(args_path),
+                method=FLAGS.method, agent_name=tr.config['agent_name'], ctr=dict(state['ctr']))
+    return tr, info
+
+
+def diag_policy_agent():
+    """(trainer with the --policy_ckpt actor (bsc agent, critic unused), source info)."""
+    path = os.path.realpath(FLAGS.policy_ckpt)
+    _check_out_dir(os.path.dirname(path))
+    tr = build_agent_trainer()
+    tr.agent, info = load_actor(tr.agent, path, tr.H)
+    return tr, dict(kind='policy_ckpt', policy_ckpt=path, sha256=file_sha256(path),
+                    **{k: v for k, v in info.items() if k in ('agent_name', 'bc_steps', 'seed', 'selected_update',
+                                                              'selection_rule')})
+
+
+def value_contract(config):
+    if FLAGS.diag_contract != 'auto':
+        return FLAGS.diag_contract
+    name = config['agent_name']
+    if name == 'acbsc':
+        return 'bsc'
+    if name == 'acfql':
+        return 'qc'
+    if name == 'acarb':
+        return config['arb_value'] if 'arb_value' in config else 'bsc'
+    diag_refuse(f'no value contract for agent {name}; pass --diag_contract')
+
+
+def diag_manifest(ident, **update):
+    """Create or check manifest.json: ident must equal the stored one (else refused); every start appends the code
+    version; update adds fields (counts, outputs)."""
+    path = os.path.join(FLAGS.run_dir, 'manifest.json')
+    norm = json.loads(json.dumps(ident, default=str))
+    if os.path.exists(path):
+        with open(path) as f:
+            man = json.load(f)
+        if man['ident'] != norm:
+            diff = {k: (man['ident'].get(k), norm.get(k)) for k in set(man['ident']) | set(norm)
+                    if man['ident'].get(k) != norm.get(k)}
+            diag_refuse(f'{path} was written with other inputs: ' + json.dumps(diff, default=str))
+    else:
+        man = dict(ident=norm, starts=[])
+    if not update:
+        man['starts'].append(dict(time=time.time(), code=code_version(), node=os.uname().nodename,
+                                  slurm_job=os.environ.get('SLURM_JOB_ID')))
+    man.update(json.loads(json.dumps(update, default=str)))
+    write_atomic(path, (json.dumps(man, indent=1) + '\n').encode())
+    return man
+
+
+def write_pickle(path, obj):
+    write_atomic(path, pickle.dumps(obj, protocol=4))
+
+
+def read_pickle(path):
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def load_queries(path):
+    q = read_pickle(path)
+    assert q.get('kind') == 'diag_queries' and q.get('version') == DIAG_QUERY_VERSION, f'{path}: not a query file'
+    if q['env_name'] != FLAGS.env_name or q['horizon_length'] != FLAGS.horizon_length:
+        diag_refuse(f'{path} is for {q["env_name"]} H={q["horizon_length"]}')
+    return q, dict(path=os.path.realpath(path), sha256=file_sha256(path), n_queries=len(q['queries']),
+                   n_states=len(q['states']))
+
+
+def query_file(states, queries, source, **meta):
+    return dict(kind='diag_queries', version=DIAG_QUERY_VERSION, env_name=FLAGS.env_name,
+                horizon_length=FLAGS.horizon_length, states=states, queries=queries, source=source, **meta)
+
+
+def _one_row_score(agent, o, a, rng):
+    from visualization.critic_probe import ensemble_score
+    s, v, oor = ensemble_score(agent, o[None], a[None], rng)
+    return s[0], v[0], oor[0]
+
+
+def _one_state_scores(agent, o, cands, rng):
+    from visualization.critic_probe import ensemble_score
+    return ensemble_score(agent, jnp.repeat(o[None], cands.shape[0], 0), cands, rng)
+
+
+_ROW_SCORES = jax.jit(jax.vmap(_one_row_score, in_axes=(None, 0, 0, None)))
+_STATE_SCORES = jax.jit(jax.vmap(_one_state_scores, in_axes=(None, 0, 0, None)))
+
+
+def _batched(fn, agent, obs, actions, rng, batch):
+    """fn over fixed-size row batches (padding: no recompiles); rows are independent of the batch layout."""
+    obs, actions = np.asarray(obs, np.float32), np.asarray(actions, np.float32)
+    outs = []
+    for s in range(0, len(obs), batch):
+        o, a = obs[s:s + batch], actions[s:s + batch]
+        m = len(o)
+        if m < batch:
+            o = np.concatenate([o, np.zeros((batch - m, *o.shape[1:]), o.dtype)])
+            a = np.concatenate([a, np.zeros((batch - m, *a.shape[1:]), a.dtype)])
+        outs.append([np.asarray(x)[:m] for x in fn(agent, o, a, rng)])
+    return [np.concatenate([o[k] for o in outs]) for k in range(3)]
+
+
+def critic_outputs(agent, obs, actions, rng, contract, per_state=False):
+    """Production ensemble readout of the critic (critic_probe.ensemble_score), per row.
+
+    A sampled readout (acarb sample_mean) draws Gumbel noise of shape (num_qs, *batch, M, L, C) from rng, so the value
+    of a chunk depends on its position in the batch. Here it is defined layout-free: each (obs, chunk) row is read out
+    alone with rng (the same key for every row); per_state=True: actions (S, N, adim), the N candidates of each state
+    read out together with rng, i.e. exactly the layout of the agent's best-of-N for one observation with readout
+    key rng. Fields: score (what best-of-n ranks by: integer S for sample_mean, else the q_agg ensemble value), value
+    (S / K_den; acbsc: mean of sigmoids (q_agg); acfql: mean Q), q_return (QC contract: acarb 100 value - 100, acfql
+    value), oor; acbsc also sigmoid_mean_logit = sigmoid(mean of the 2 logits)."""
+    if per_state:
+        score, value, oor = _batched(_STATE_SCORES, agent, obs, actions, rng, 8)
+    else:
+        score, value, oor = _batched(_ROW_SCORES, agent, obs, actions, rng, 256)
+    name = agent.config['agent_name']
+    out = dict(score=score, value=value.astype(np.float64), oor=oor)
+    if contract == 'qc':
+        out['q_return'] = 100.0 * out['value'] - 100.0 if name == 'acarb' else out['value']
+    if name == 'acbsc':
+        o, x = np.asarray(obs, np.float32), np.asarray(actions, np.float32)
+        if per_state:
+            o, x = np.repeat(o, x.shape[1], 0), x.reshape(-1, x.shape[-1])
+        f = jax.jit(lambda a, o, x: a.network.select('critic')(o, x))
+        logits = np.concatenate([np.asarray(f(agent, o[s:s + 256], x[s:s + 256])) for s in range(0, len(o), 256)],
+                                axis=-1)
+        out['sigmoid_mean_logit'] = (1.0 / (1.0 + np.exp(-logits.astype(np.float64).mean(0)))).reshape(score.shape)
+    return out
+
+
+def _row(out, i):
+    return {k: (v[i].item() if np.ndim(v[i]) == 0 else np.asarray(v[i]).tolist()) for k, v in out.items()}
+
+
+def sampled_readout(config):
+    return config['agent_name'] == 'acarb' and config['arb_readout'] in ('sample', 'sample_mean')
+
+
+def diag_stop(tr):
+    if tr.watcher is not None:
+        tr.watcher.check(min_interval=0.5)
+    return tr.stop_requested
+
+
+def diag_exit_preempted(tr, done):
+    tr.close_envs()
+    dt = time.time() - tr.t_stop_ref
+    print(f'EXIT_PREEMPTED source={tr.stop_source} notice_to_exit_s={dt:.2f} phase={FLAGS.mode} parts_done={done}',
+          flush=True)
+    sys.exit(EXIT_PREEMPTED)
+
+
+def _part_done(path, ident):
+    if not os.path.exists(path):
+        return None
+    part = read_pickle(path)
+    if json.loads(json.dumps(part['ident'], default=str)) != json.loads(json.dumps(ident, default=str)):
+        diag_refuse(f'{path} was written with other inputs')
+    return part
+
+
+def diag_anchors(tr, source):
+    from utils import diag_v1
+    panel = source['kind'] == 'policy_ckpt'
+    rule = 'n1' if panel else FLAGS.diag_rule
+    if panel and FLAGS.diag_rule != 'n1':
+        diag_refuse('the common panel (--policy_ckpt) uses the n1 rule')
+    C, n_seeds, E = FLAGS.n_eval_envs, FLAGS.diag_n_seeds, FLAGS.diag_episodes
+    if n_seeds <= 0 or C <= 0 or n_seeds % C:
+        diag_refuse(f'--diag_n_seeds={n_seeds} is not a positive multiple of --n_eval_envs={C}')
+    contract = None if panel else value_contract(tr.config)
+    ident = dict(mode='diag_anchors', source=source, env_name=FLAGS.env_name, horizon_length=tr.H, rule=rule,
+                 diag_seed=FLAGS.diag_seed, final_seed_base=FLAGS.final_seed_base, diag_n_seeds=n_seeds,
+                 n_eval_envs=C, diag_episodes=E, anchors=FLAGS.anchors, contract=contract,
+                 label='diagnostic replays (not the official final_eval trajectories)')
+    diag_manifest(ident)
+    parts_dir = os.path.join(FLAGS.run_dir, 'parts')
+    os.makedirs(parts_dir, exist_ok=True)
+    policy = diag_v1.row_policy(tr.agent, rule)
+    step_dim = tr.config['action_dim']
+    base_key = np.asarray(jax.random.PRNGKey(FLAGS.diag_seed))
+    tr.eval_envs = None
+    parts, done = [], 0
+    for c in range(n_seeds // C):
+        path = os.path.join(parts_dir, f'replay_{c}.pkl')
+        seeds = [FLAGS.final_seed_base + c * C + i for i in range(C)]
+        part = _part_done(path, ident)
+        if part is not None:
+            print(f'DIAG_PART_SKIP replay chunk={c}', flush=True)
+            parts.append(part)
+            done += 1
+            continue
+        if diag_stop(tr):
+            diag_exit_preempted(tr, done)
+        if tr.eval_envs is None:
+            tr.eval_envs = diag_v1.make_pool(FLAGS.env_name, C)
+        t0 = time.time()
+        comp = diag_v1.SnapCompactor()
+        try:
+            decisions, eps = diag_v1.run_replays(tr.eval_envs, C, seeds, E, policy, base_key, tr.H, step_dim,
+                                                 stop=lambda: diag_stop(tr), compactor=comp)
+        except diag_v1.Aborted:
+            diag_exit_preempted(tr, done)
+        if not panel:
+            sc = critic_outputs(tr.agent, np.stack([d['obs'] for d in decisions]),
+                                np.stack([d['chunk'] for d in decisions]), jax.random.PRNGKey(0), contract)
+            for i, d in enumerate(decisions):
+                d['critic'] = _row(sc, i)
+        part = dict(ident=ident, chunk=c, seeds=seeds, episodes=eps, decisions=decisions, bases=comp.bases,
+                    wall_s=time.time() - t0)
+        write_pickle(path, part)
+        parts.append(part)
+        done += 1
+        print(f'DIAG_PART replay chunk={c} decisions={len(decisions)} successes={int(eps["success"].sum())}/{C * E} '
+              f'wall_s={part["wall_s"]:.1f}', flush=True)
+    tr.close_envs()
+
+    # Anchors: the predeclared stratified rule over every decision of every part.
+    meta, where = [], []
+    for p in parts:
+        L, S = p['episodes']['length'], p['episodes']['success']
+        for j, d in enumerate(p['decisions']):
+            meta.append(dict(seed=d['seed'], episode=d['episode'], step=d['step'], length=int(L[d['env'], d['episode']]),
+                             success=int(S[d['env'], d['episode']])))
+            where.append((p, j))
+    picks = diag_v1.select_anchors(meta, FLAGS.anchors, FLAGS.diag_seed)
+    states, queries, rows = [], [], []
+    for qi, a in enumerate(picks):
+        p, j = where[a['index']]
+        d = p['decisions'][j]
+        info = dict(seed=d['seed'], episode=d['episode'], decision=d['decision'], step=d['step'], t=d['t'],
+                    length=meta[a['index']]['length'], success=meta[a['index']]['success'],
+                    **{k: a[k] for k in ('stratum', 'third', 'weight', 'N_h', 'n_h', 'S_h', 'n_hs')},
+                    critic=d.get('critic'))
+        states.append(diag_v1.expand_snapshot(d['snap'], p['bases']))
+        queries.append(dict(qid=qi, state=qi, label='executed', chunk=d['chunk'], meta=info))
+        rows.append(info)
+    write_pickle(os.path.join(FLAGS.run_dir, 'anchors.pkl'), query_file(states, queries, source, ident=ident))
+    S_all = np.concatenate([p['episodes']['success'] for p in parts])
+    L_all = np.concatenate([p['episodes']['length'] for p in parts])
+    digests = sum((p['episodes']['first_obs_digest'] for p in parts), [])
+    summary = dict(ident=ident, decisions=len(meta), episodes=int(S_all.size), successes=int(S_all.sum()),
+                   per_episode_success=S_all.tolist(), per_episode_length=L_all.tolist(), first_obs_digest=digests,
+                   strata={h: sum(r['stratum'] == h for r in rows) for h in sorted({r['stratum'] for r in rows})},
+                   anchors=rows, wall_s=float(sum(p['wall_s'] for p in parts)))
+    write_atomic(os.path.join(FLAGS.run_dir, 'anchors.json'), (json.dumps(summary, indent=1, default=str) + '\n').encode())
+    diag_manifest(ident, complete=True, counts=dict(decisions=len(meta), episodes=int(S_all.size), anchors=len(rows)),
+                  outputs=['anchors.pkl', 'anchors.json'],
+                  anchors_sha256=file_sha256(os.path.join(FLAGS.run_dir, 'anchors.pkl')))
+    print(f'DIAG_ANCHORS decisions={len(meta)} episodes={S_all.size} successes={int(S_all.sum())} anchors={len(rows)} '
+          f'strata={json.dumps(summary["strata"])}', flush=True)
+
+
+def diag_mc(tr, source):
+    from utils import diag_v1
+    qf, qinfo = load_queries(FLAGS.queries)
+    contract = value_contract(tr.config)
+    t_extra = FLAGS.mc_t_extra if contract == 'qc' else 0
+    K, P = FLAGS.mc_k, FLAGS.mc_part_size
+    ident = dict(mode='diag_mc', source=source, queries=qinfo, env_name=FLAGS.env_name, horizon_length=tr.H,
+                 contract=contract, continuation=FLAGS.continuation, mc_k=K, mc_seed=FLAGS.mc_seed, t_extra=t_extra,
+                 tail_bound_at_t_extra=diag_v1.qc_tail_bound(t_extra) if contract == 'qc' else None,
+                 mc_part_size=P, n_eval_envs=FLAGS.n_eval_envs)
+    diag_manifest(ident)
+    parts_dir = os.path.join(FLAGS.run_dir, 'parts')
+    os.makedirs(parts_dir, exist_ok=True)
+    policy = diag_v1.row_policy(tr.agent, FLAGS.continuation)
+    step_dim = tr.config['action_dim']
+    N = FLAGS.n_eval_envs
+    qs = qf['queries']
+    tr.eval_envs = None
+    results, done, walls = {}, 0, []
+    for p in range((len(qs) + P - 1) // P):
+        path = os.path.join(parts_dir, f'mc_{p}.pkl')
+        part = _part_done(path, ident)
+        if part is not None:
+            print(f'DIAG_PART_SKIP mc part={p}', flush=True)
+            results.update(part['results'])
+            walls.append(part['wall_s'])
+            done += 1
+            continue
+        if diag_stop(tr):
+            diag_exit_preempted(tr, done)
+        if tr.eval_envs is None:
+            tr.eval_envs = diag_v1.make_pool(FLAGS.env_name, N)
+        t0 = time.time()
+        jobs = [dict(q=q['qid'], k=k, snap=qf['states'][q['state']], chunk=q['chunk'],
+                     np_seed=diag_v1.mc_np_seed(FLAGS.mc_seed, q['qid'], k),
+                     key=diag_v1.mc_job_key(FLAGS.mc_seed, q['qid'], k))
+                for q in qs[p * P:(p + 1) * P] for k in range(K)]
+        try:
+            res = diag_v1.run_mc_jobs(tr.eval_envs, N, jobs, policy, contract, t_extra, tr.H, step_dim,
+                                      stop=lambda: diag_stop(tr))
+        except diag_v1.Aborted:
+            diag_exit_preempted(tr, done)
+        part = dict(ident=ident, part=p, results=res, wall_s=time.time() - t0)
+        write_pickle(path, part)
+        results.update(res)
+        walls.append(part['wall_s'])
+        done += 1
+        print(f'DIAG_PART mc part={p} queries={len(jobs) // K} continuations={len(jobs)} '
+              f'wall_s={part["wall_s"]:.1f}', flush=True)
+    tr.close_envs()
+    out = []
+    for q in qs:
+        runs = [results[q['qid'], k] for k in range(K)]
+        row = dict(qid=q['qid'], state=q['state'], label=q['label'], meta=q.get('meta'), K=K,
+                   steps=[r['steps'] for r in runs], success=[r['success'] for r in runs],
+                   decisions=[r['decisions'] for r in runs],
+                   first_actor_digest=[r['first_actor_digest'] for r in runs],
+                   final_obs_digest=[r['final_obs_digest'] for r in runs])
+        if contract == 'bsc':
+            row['G'] = [r['G'] for r in runs]
+            row['mean'], row['se'] = diag_v1.mean_se(row['G'])
+        else:
+            for k in ('G_cut', 'G_ext', 'tail_bound', 'success_before_limit', 'steps_past_limit'):
+                row[k] = [r[k] for r in runs]
+            row['mean'], row['se'] = diag_v1.mean_se(row['G_ext'])
+            row['mean_cut'], row['se_cut'] = diag_v1.mean_se(row['G_cut'])
+            row['max_tail_bound'] = max(row['tail_bound'])
+        out.append(row)
+    res = dict(ident=ident, queries=out, wall_s=float(sum(walls)))
+    write_atomic(os.path.join(FLAGS.run_dir, 'mc.json'), (json.dumps(res, indent=1, default=str) + '\n').encode())
+    diag_manifest(ident, complete=True, counts=dict(queries=len(qs), continuations=len(qs) * K),
+                  outputs=['mc.json'])
+    print(f'DIAG_MC queries={len(qs)} K={K} contract={contract} mean_of_means={np.mean([r["mean"] for r in out]):.4f}',
+          flush=True)
+
+
+def diag_score(tr, source):
+    qf, qinfo = load_queries(FLAGS.queries)
+    contract = value_contract(tr.config)
+    R = FLAGS.score_keys if sampled_readout(tr.config) else 0
+    keys = [('PRNGKey(0)', jax.random.PRNGKey(0))] + \
+        [(f'fold_in(PRNGKey({SCORE_SEED}), {r})', jax.random.fold_in(jax.random.PRNGKey(SCORE_SEED), r)) for r in range(R)]
+    ident = dict(mode='diag_score', source=source, queries=qinfo, env_name=FLAGS.env_name, horizon_length=tr.H,
+                 contract=contract, keys=[k for k, _ in keys])
+    diag_manifest(ident)
+    path = os.path.join(FLAGS.run_dir, 'scores.json')
+    if os.path.exists(path):
+        print('DIAG_SCORE_SKIP (scores.json present)', flush=True)
+        return
+    qs = qf['queries']
+    obs = np.stack([qf['states'][q['state']]['obs'] for q in qs])
+    acts = np.stack([q['chunk'] for q in qs])
+    outs = [critic_outputs(tr.agent, obs, acts, key, contract) for _, key in keys]
+    rows = []
+    for i, q in enumerate(qs):
+        row = dict(qid=q['qid'], state=q['state'], label=q['label'], **_row(outs[0], i))
+        if R:
+            row['keys'] = {k: [_row(o, i)[k] for o in outs] for k in outs[0]}
+            v = np.array(row['keys']['value'], np.float64)
+            row['value_sd_over_keys'] = float(v.std(ddof=1))
+        rows.append(row)
+    write_atomic(path, (json.dumps(dict(ident=ident, queries=rows), indent=1, default=str) + '\n').encode())
+    diag_manifest(ident, complete=True, counts=dict(queries=len(qs), keys=len(keys)), outputs=['scores.json'])
+    print(f'DIAG_SCORE queries={len(qs)} keys={len(keys)}', flush=True)
+
+
+def diag_select(tr, source):
+    from utils import diag_v1
+    from visualization.critic_probe import make_candidates
+    qf, qinfo = load_queries(FLAGS.queries)
+    contract = value_contract(tr.config)
+    N = tr.config['actor_num_samples']
+    n_sub = FLAGS.mc_candidates
+    if not 0 <= n_sub <= N:
+        diag_refuse(f'--mc_candidates={n_sub} not in [0, {N}]')
+    ident = dict(mode='diag_select', source=source, panel=qinfo, env_name=FLAGS.env_name, horizon_length=tr.H,
+                 contract=contract, sel_seed=FLAGS.sel_seed, candidates=N, mc_candidates=n_sub,
+                 readout_key='PRNGKey(0)')
+    diag_manifest(ident)
+    if os.path.exists(os.path.join(FLAGS.run_dir, 'select.json')):
+        print('DIAG_SELECT_SKIP (select.json present)', flush=True)
+        return
+    adim = tr.config['action_dim'] * tr.H
+    S = len(qf['states'])
+    obs = np.stack([s['obs'] for s in qf['states']]).astype(np.float32)
+    noise = np.stack([np.asarray(jax.random.normal(diag_v1.selection_noise_key(FLAGS.sel_seed, i), (N, adim)))
+                      for i in range(S)]).astype(np.float32)
+    cands = np.clip(make_candidates(tr.agent, obs, noise), -1, 1).astype(np.float32)  # as agent._candidates
+    sc = critic_outputs(tr.agent, obs, cands, jax.random.PRNGKey(0), contract, per_state=True)  # each (S, N)
+    states, queries, rows = [], [], []
+    for i in range(S):
+        chosen = int(np.argmax(sc['score'][i]))  # first index on ties, as best-of-n
+        uni = diag_v1.uniform_index(FLAGS.sel_seed, i, N)
+        sub = diag_v1.candidate_subset(FLAGS.sel_seed, i, N, n_sub, chosen) if n_sub else []
+        states.append(qf['states'][i])
+        for label, j in [('chosen', chosen), ('uniform', uni)] + [('cand', j) for j in sub]:
+            queries.append(dict(qid=len(queries), state=i, label=label, chunk=cands[i, j],
+                                meta=dict(panel_state=i, candidate=j, panel_meta=_panel_meta(qf, i),
+                                          critic={k: sc[k][i, j].item() for k in sc})))
+        top = sc['score'][i] == sc['score'][i].max()
+        rows.append(dict(state=i, chosen=chosen, uniform=uni, subset=sub, ties_at_max=int(top.sum()),
+                         **{k: sc[k][i].tolist() for k in sc}))
+    write_pickle(os.path.join(FLAGS.run_dir, 'select_queries.pkl'), query_file(states, queries, source, ident=ident))
+    write_atomic(os.path.join(FLAGS.run_dir, 'select.json'),
+                 (json.dumps(dict(ident=ident, states=rows), indent=1, default=str) + '\n').encode())
+    diag_manifest(ident, complete=True, counts=dict(states=S, queries=len(queries)),
+                  outputs=['select.json', 'select_queries.pkl'],
+                  queries_sha256=file_sha256(os.path.join(FLAGS.run_dir, 'select_queries.pkl')))
+    print(f'DIAG_SELECT states={S} queries={len(queries)} chosen_eq_uniform={sum(r["chosen"] == r["uniform"] for r in rows)}',
+          flush=True)
+
+
+def _panel_meta(qf, state):
+    for q in qf['queries']:
+        if q['state'] == state:
+            return {k: v for k, v in (q.get('meta') or {}).items() if k != 'critic'}
+    return None
+
+
+def diag_main():
+    if FLAGS.mode == 'diag_anchors' and FLAGS.policy_ckpt:
+        if FLAGS.src_run_dir:
+            diag_refuse('--policy_ckpt and --src_run_dir are exclusive')
+        tr, source = diag_policy_agent()
+    else:
+        tr, source = diag_frozen_agent()
+    if FLAGS.mode != 'diag_anchors' and not FLAGS.queries:
+        diag_refuse('--queries is required')
+    try:
+        dict(diag_anchors=diag_anchors, diag_mc=diag_mc, diag_score=diag_score, diag_select=diag_select)[FLAGS.mode](
+            tr, source)
+    except SystemExit:
+        raise
+    except BaseException:
+        exit_on_exception(tr)
+    tr.close_envs()
+
+
 def main(_):
     assert FLAGS.run_dir or FLAGS.mode == 'make_probe_candidates', '--run_dir is required'
     if FLAGS.mode == 'arb_introspect':
@@ -1534,6 +2065,9 @@ def main(_):
         return
     if FLAGS.mode == 'final_eval':
         final_eval()
+        return
+    if FLAGS.mode.startswith('diag_'):
+        diag_main()
         return
     if FLAGS.mode == 'eval_actor':
         assert FLAGS.init_actor, '--init_actor is required for --mode=eval_actor'
