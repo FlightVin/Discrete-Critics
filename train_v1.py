@@ -1647,12 +1647,23 @@ def query_file(states, queries, source, **meta):
                 horizon_length=FLAGS.horizon_length, states=states, queries=queries, source=source, **meta)
 
 
-def _score_batches(agent, obs, actions, rng, batch=256):
-    """critic_probe.ensemble_score in fixed-size batches: (score, value, oor) numpy arrays."""
+def _one_row_score(agent, o, a, rng):
     from visualization.critic_probe import ensemble_score
-    global _ENSEMBLE_SCORE_JIT
-    if _ENSEMBLE_SCORE_JIT is None:
-        _ENSEMBLE_SCORE_JIT = jax.jit(ensemble_score)
+    s, v, oor = ensemble_score(agent, o[None], a[None], rng)
+    return s[0], v[0], oor[0]
+
+
+def _one_state_scores(agent, o, cands, rng):
+    from visualization.critic_probe import ensemble_score
+    return ensemble_score(agent, jnp.repeat(o[None], cands.shape[0], 0), cands, rng)
+
+
+_ROW_SCORES = jax.jit(jax.vmap(_one_row_score, in_axes=(None, 0, 0, None)))
+_STATE_SCORES = jax.jit(jax.vmap(_one_state_scores, in_axes=(None, 0, 0, None)))
+
+
+def _batched(fn, agent, obs, actions, rng, batch):
+    """fn over fixed-size row batches (padding: no recompiles); rows are independent of the batch layout."""
     obs, actions = np.asarray(obs, np.float32), np.asarray(actions, np.float32)
     outs = []
     for s in range(0, len(obs), batch):
@@ -1661,28 +1672,36 @@ def _score_batches(agent, obs, actions, rng, batch=256):
         if m < batch:
             o = np.concatenate([o, np.zeros((batch - m, *o.shape[1:]), o.dtype)])
             a = np.concatenate([a, np.zeros((batch - m, *a.shape[1:]), a.dtype)])
-        outs.append([np.asarray(x)[:m] for x in _ENSEMBLE_SCORE_JIT(agent, o, a, rng)])
+        outs.append([np.asarray(x)[:m] for x in fn(agent, o, a, rng)])
     return [np.concatenate([o[k] for o in outs]) for k in range(3)]
 
 
-_ENSEMBLE_SCORE_JIT = None
+def critic_outputs(agent, obs, actions, rng, contract, per_state=False):
+    """Production ensemble readout of the critic (critic_probe.ensemble_score), per row.
 
-
-def critic_outputs(agent, obs, actions, rng, contract):
-    """Per row: score (what best-of-n ranks by: integer S for acarb sample_mean, else the q_agg ensemble value),
-    value (S / K_den; acbsc: mean of sigmoids (q_agg); acfql: mean Q), q_return (QC contract: acarb 100 value - 100,
-    acfql value; else None), oor; acbsc also sigmoid_mean_logit = sigmoid(mean of the logits)."""
-    score, value, oor = _score_batches(agent, obs, actions, rng)
+    A sampled readout (acarb sample_mean) draws Gumbel noise of shape (num_qs, *batch, M, L, C) from rng, so the value
+    of a chunk depends on its position in the batch. Here it is defined layout-free: each (obs, chunk) row is read out
+    alone with rng (the same key for every row); per_state=True: actions (S, N, adim), the N candidates of each state
+    read out together with rng, i.e. exactly the layout of the agent's best-of-N for one observation with readout
+    key rng. Fields: score (what best-of-n ranks by: integer S for sample_mean, else the q_agg ensemble value), value
+    (S / K_den; acbsc: mean of sigmoids (q_agg); acfql: mean Q), q_return (QC contract: acarb 100 value - 100, acfql
+    value), oor; acbsc also sigmoid_mean_logit = sigmoid(mean of the 2 logits)."""
+    if per_state:
+        score, value, oor = _batched(_STATE_SCORES, agent, obs, actions, rng, 8)
+    else:
+        score, value, oor = _batched(_ROW_SCORES, agent, obs, actions, rng, 256)
     name = agent.config['agent_name']
     out = dict(score=score, value=value.astype(np.float64), oor=oor)
     if contract == 'qc':
         out['q_return'] = 100.0 * out['value'] - 100.0 if name == 'acarb' else out['value']
     if name == 'acbsc':
+        o, x = np.asarray(obs, np.float32), np.asarray(actions, np.float32)
+        if per_state:
+            o, x = np.repeat(o, x.shape[1], 0), x.reshape(-1, x.shape[-1])
         f = jax.jit(lambda a, o, x: a.network.select('critic')(o, x))
-        logits = np.concatenate([np.asarray(f(agent, np.asarray(obs[s:s + 256], np.float32),
-                                              np.asarray(actions[s:s + 256], np.float32)))
-                                 for s in range(0, len(obs), 256)], axis=-1)
-        out['sigmoid_mean_logit'] = 1.0 / (1.0 + np.exp(-logits.astype(np.float64).mean(0)))
+        logits = np.concatenate([np.asarray(f(agent, o[s:s + 256], x[s:s + 256])) for s in range(0, len(o), 256)],
+                                axis=-1)
+        out['sigmoid_mean_logit'] = (1.0 / (1.0 + np.exp(-logits.astype(np.float64).mean(0)))).reshape(score.shape)
     return out
 
 
@@ -1937,8 +1956,7 @@ def diag_select(tr, source):
     noise = np.stack([np.asarray(jax.random.normal(diag_v1.selection_noise_key(FLAGS.sel_seed, i), (N, adim)))
                       for i in range(S)]).astype(np.float32)
     cands = np.clip(make_candidates(tr.agent, obs, noise), -1, 1).astype(np.float32)  # as agent._candidates
-    sc = critic_outputs(tr.agent, np.repeat(obs, N, 0), cands.reshape(S * N, adim), jax.random.PRNGKey(0), contract)
-    sc = {k: v.reshape(S, N) for k, v in sc.items()}
+    sc = critic_outputs(tr.agent, obs, cands, jax.random.PRNGKey(0), contract, per_state=True)  # each (S, N)
     states, queries, rows = [], [], []
     for i in range(S):
         chosen = int(np.argmax(sc['score'][i]))  # first index on ties, as best-of-n
