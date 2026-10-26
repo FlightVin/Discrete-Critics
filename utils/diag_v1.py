@@ -300,19 +300,29 @@ def _entry_bytes(v):
     return pickle.dumps(v, protocol=4)
 
 
+class SnapCompactor:
+    """Stores each snapshot's py state as a delta against a base py state (the first snapshot of the same stream,
+    e.g. one env's episode; a new base when the entry set changes or more than half the entries differ).
+    Exact: entries compare by pickled bytes. bases: list of full py states; expand_snapshot inverts."""
+
+    def __init__(self):
+        self.bases = []
+        self.cur = {}  # stream -> (base index, {entry: pickled bytes})
+
+    def add(self, snap, stream=0):
+        py_b = {k: _entry_bytes(v) for k, v in snap['py'].items()}
+        base = self.cur.get(stream)
+        if base is None or base[1].keys() != py_b.keys() or sum(base[1][k] != b for k, b in py_b.items()) > len(py_b) // 2:
+            self.bases.append(snap['py'])
+            base = self.cur[stream] = (len(self.bases) - 1, py_b)
+        delta = {k: snap['py'][k] for k, b in py_b.items() if base[1][k] != b}
+        return dict({k: v for k, v in snap.items() if k != 'py'}, py_base=base[0], py_delta=delta)
+
+
 def compact_snapshots(snaps):
-    """(bases, compact list): each snapshot's py state as a delta against a base (the first snapshot of the same
-    episode, here: the most recent base whose entry set matches). Exact: equality by pickled bytes."""
-    bases, out, base_bytes = [], [], None
-    for s in snaps:
-        py_b = {k: _entry_bytes(v) for k, v in s['py'].items()}
-        if base_bytes is None or base_bytes.keys() != py_b.keys() or \
-                sum(base_bytes[k] != b for k, b in py_b.items()) > len(py_b) // 2:
-            bases.append(s['py'])
-            base_bytes = py_b
-        delta = {k: s['py'][k] for k, b in py_b.items() if base_bytes[k] != b}
-        out.append(dict({k: v for k, v in s.items() if k != 'py'}, py_base=len(bases) - 1, py_delta=delta))
-    return bases, out
+    c = SnapCompactor()
+    out = [c.add(s) for s in snaps]
+    return c.bases, out
 
 
 def expand_snapshot(c, bases):
@@ -513,12 +523,13 @@ def run_mc_jobs(envs, n, jobs, policy, contract, t_extra, H, step_dim, stop=None
 
 
 # ---- episode replays (anchors) ---------------------------------------------------------------------------------
-def run_replays(envs, n, seeds, episodes, policy, base_key, H, step_dim, stop=None):
+def run_replays(envs, n, seeds, episodes, policy, base_key, H, step_dim, stop=None, compactor=None):
     """Episodes of `policy` on env seeds (numpy seed of env i = seeds[i], then `episodes` resets, as final_eval /
     evaluate_parallel: all envs reset together, finished envs step zero actions until every env is done).
     Decision d of episode e on seed s uses key fold_in(fold_in(fold_in(base_key, s), e), d).
-    Returns (decisions, episodes): decisions = list of dict(seed, episode, decision, step, t, obs, chunk, snap);
-    episodes = dict(success (n, E), length (n, E), first_obs_digest (n, E))."""
+    Returns (decisions, episodes): decisions = list of dict(seed, env, episode, decision, step, t, obs, chunk, snap)
+    (snap compacted by `compactor`, stream (env, episode), if given); episodes = dict(success (n, E), length (n, E),
+    first_obs_digest (n, E))."""
     assert len(seeds) == n
     pool_exec(envs, [('seed', int(s)) for s in seeds])
     succ = np.zeros((n, episodes), np.int64)
@@ -545,6 +556,8 @@ def run_replays(envs, n, seeds, episodes, policy, base_key, H, step_dim, stop=No
                 for i, c in zip(need, chunks):
                     s = snaps[i]
                     s['obs'] = np.array(obs[i], copy=True)
+                    if compactor is not None:
+                        s = compactor.add(s, (i, e))
                     decisions.append(dict(seed=int(seeds[i]), env=i, episode=e, decision=int(d[i]), step=int(length[i, e]),
                                           t=int(s['t']), obs=s['obs'], chunk=np.asarray(c, np.float32), snap=s))
                     queues[i] = list(np.asarray(c).reshape(H, step_dim))
