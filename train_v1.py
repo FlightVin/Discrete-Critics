@@ -160,7 +160,9 @@ config_flags.DEFINE_config_file('agent', 'agents/acbsc.py', lock_config=False)
 RESTART_FREE_FLAGS = {'ckpt_minutes', 'project_name', 'run_group', 'wandb_name', 'log_interval', 'preempt_budget_s'}
 # Flags added after runs were started: left out of args.json at their default (older run dirs still resume).
 LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'replay_rng': 'global',
-                       'src_run_dir': None, 'out': None, 'final_seed_base': 100000, 'final_n_seeds': 256}
+                       'src_run_dir': None, 'out': None, 'final_seed_base': 100000, 'final_n_seeds': 256,
+                       'queries': None, 'candidates': None, 'introspect_seed': 0, 'introspect_chunk': 256,
+                       'introspect_components': ['trace', 'forced', 'ablation', 'candidates', 'labelfit']}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
