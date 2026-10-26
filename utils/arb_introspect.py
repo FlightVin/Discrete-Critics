@@ -561,3 +561,56 @@ def run_mode(agent, out_dir, ident, queries_path, candidates_path=None, chunk=25
     print('ARB_INTROSPECT ' + json.dumps({k: v for k, v in summary.items() if k in ('n_queries', 'trace', 'ablation')},
                                          default=str), flush=True)
     return summary
+
+
+# ---- query files ---------------------------------------------------------------------------------------------
+def make_queries(env_name, H, n, seed, out, src_run_dir=None, online_only=False, discount=0.99):
+    """Query / panel npz from the processed demos (train_v1.process_demos) and, with src_run_dir, the online rows
+    of that run's committed main buffer (segments read-only): n sequences sampled as the training replay samples
+    them (SeqReplay.sample_sequence, np.random.Generator(PCG64(seed))). No reference values (add ref_value /
+    ref_se / clean_value in method units from an MC estimate, e.g. geo5a's)."""
+    from envs.env_utils import make_env_and_datasets
+    from train_v1 import process_demos, read_committed_state
+    from utils.replay_v1 import SeqReplay
+    _, _, ds, _ = make_env_and_datasets(env_name)
+    demos = process_demos(ds, env_name, H, True)
+    rng = np.random.Generator(np.random.PCG64(seed))
+    meta, segs = None, []
+    if src_run_dir:
+        state, man = read_committed_state(src_run_dir)
+        meta = state['buffers']['main']
+        for e in man['segments'].get('main', []):
+            with np.load(os.path.join(src_run_dir, 'ckpt', 'segments', e['file'])) as z:
+                segs.append((e['k_from'], e['k_to'], {kk: z[kk] for kk in z.files}))
+    buf = SeqReplay(demos, meta['cap'] if meta else len(demos['observations']) + 1, H, episodic=False, rng=rng)
+    if meta:
+        buf.restore(meta, segs)
+    if online_only:
+        assert buf.num_online_starts > 0, 'no online rows'
+
+        def online_starts(b):
+            k0 = buf.k_lo + rng.integers(buf.num_online_starts, size=b)
+            return buf.slot(k0), np.ones(b, bool), k0
+
+        buf.sample_starts = online_starts
+    batch = buf.sample_sequence(n, H, discount)
+    arrays = {kk: np.asarray(batch[kk]) for kk in PANEL_KEYS}
+    arrays['observations'] = arrays['observations'].astype(np.float32)
+    arrays['actions'] = arrays['actions'].astype(np.float32)
+    _write_npz(out, arrays)
+    print(f'MAKE_QUERIES out={out} n={n} sha256={file_sha256(out)}', flush=True)
+
+
+if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('cmd', choices=['make_queries'])
+    ap.add_argument('--env_name', default='square-mh-low_dim')
+    ap.add_argument('--horizon_length', type=int, default=5)
+    ap.add_argument('--n', type=int, default=1024)
+    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--src_run_dir', default=None)
+    ap.add_argument('--online_only', action='store_true')
+    a = ap.parse_args()
+    make_queries(a.env_name, a.horizon_length, a.n, a.seed, a.out, a.src_run_dir, a.online_only)

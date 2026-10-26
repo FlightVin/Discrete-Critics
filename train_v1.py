@@ -89,11 +89,12 @@ if 'CUDA_VISIBLE_DEVICES' in os.environ:
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
-                                      'final_eval'],
+                                      'final_eval', 'arb_introspect'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
                   'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
-                  'committed checkpoint of a finished --src_run_dir (read-only).')
+                  'committed checkpoint of a finished --src_run_dir (read-only); arb_introspect: AR-B critic '
+                  'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -126,6 +127,12 @@ flags.DEFINE_string('src_run_dir', None, 'probe_ckpt / final_eval: run directory
 flags.DEFINE_integer('final_seed_base', 100000, 'final_eval: env seed j is final_seed_base + j.')
 flags.DEFINE_integer('final_n_seeds', 256, 'final_eval: env seeds (a multiple of --n_eval_envs).')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
+flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py).')
+flags.DEFINE_string('candidates', None, 'arb_introspect: optional candidate-set npz (observations, candidates).')
+flags.DEFINE_integer('introspect_seed', 0, 'arb_introspect: base PRNG seed of the readout noise.')
+flags.DEFINE_integer('introspect_chunk', 256, 'arb_introspect: queries per resumable part.')
+flags.DEFINE_list('introspect_components', ['trace', 'forced', 'ablation', 'candidates', 'labelfit'],
+                  'arb_introspect: components to run.')
 flags.DEFINE_integer('log_interval', 5000, 'Log interval (updates / env steps).')
 flags.DEFINE_float('ckpt_minutes', 20.0, 'Periodic checkpoint interval (minutes) at safe points.')
 flags.DEFINE_float('preempt_budget_s', 60.0, 'After a preemption notice: if no safe point has been reached '
@@ -1475,8 +1482,45 @@ def run_final_eval(tr, src, state, man, n_seeds, C, E):
     return out
 
 
+def arb_introspect():
+    """--mode=arb_introspect: utils/arb_introspect.run_mode on the agent of --src_run_dir's committed checkpoint
+    (read-only, any phase), the agent built from the query file's shapes (no env, no dataset). Config checked
+    against the source as in final_eval. Output: <run_dir>/arb_introspect{.json,.npz} and resumable parts."""
+    from utils import arb_introspect as AI
+    if not (FLAGS.src_run_dir and FLAGS.queries):
+        refuse('--src_run_dir and --queries are required')
+    src, out_dir = os.path.realpath(FLAGS.src_run_dir), os.path.realpath(FLAGS.run_dir)
+    if src == out_dir or out_dir.startswith(src + os.sep):
+        refuse(f'--run_dir {out_dir} lies inside --src_run_dir {src}')
+    state, man = read_committed_state(src)
+    args_path = os.path.join(src, 'args.json')
+    if not os.path.exists(args_path):
+        refuse(f'{args_path} not found')
+    with open(args_path) as f:
+        src_args = json.load(f)
+    config = resolve_agent_config(FLAGS.method, FLAGS.agent, sys.argv)
+    config['horizon_length'] = FLAGS.horizon_length
+    check_agent_config('arb_introspect', config)
+    with np.load(FLAGS.queries) as z:
+        obs0, act0 = np.asarray(z['observations'][0], np.float32), np.asarray(z['actions'][0], np.float32)
+    agent = agents[config['agent_name']].create(
+        FLAGS.seed, obs0, np.zeros(act0.size // FLAGS.horizon_length, np.float32), config)
+    diff = source_config_diff(src, src_args, config)
+    if diff:
+        refuse('config differs from the source run (source, this call): ' + json.dumps(diff, default=str))
+    agent = flax.serialization.from_state_dict(split_optimizer(agent), state['agent'])
+    os.makedirs(out_dir, exist_ok=True)
+    ident = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], method=FLAGS.method,
+                 agent=strip_later_agent_defaults(config.to_dict()))
+    AI.run_mode(agent, out_dir, ident, FLAGS.queries, FLAGS.candidates, chunk=FLAGS.introspect_chunk,
+                seed=FLAGS.introspect_seed, components=tuple(FLAGS.introspect_components))
+
+
 def main(_):
     assert FLAGS.run_dir or FLAGS.mode == 'make_probe_candidates', '--run_dir is required'
+    if FLAGS.mode == 'arb_introspect':
+        arb_introspect()
+        return
     if FLAGS.mode == 'make_probe_candidates':
         make_probe_candidates()
         return
