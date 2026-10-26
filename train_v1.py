@@ -157,6 +157,8 @@ LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'r
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
+# The same, per agent (the key predates these runs in other agents, where it is kept).
+LATER_AGENT_KEY_DEFAULTS = {'acfql': {'critic_target_bon': True}}
 REPLAY_SEED_OFFSET = 1_000_003
 EXIT_PREEMPTED = 143
 ONLINE_PHASES = ['warmup', 'pretrain', 'pretrain_eval', 'joint', 'done']
@@ -350,9 +352,10 @@ def resolved_qc_args(config):
 
 
 def strip_later_agent_defaults(agent_dict):
-    """Agent config dict without the LATER_AGENT_DEFAULTS keys that are at their default."""
-    return {k: v for k, v in agent_dict.items()
-            if not (k in LATER_AGENT_DEFAULTS and v == LATER_AGENT_DEFAULTS[k])}
+    """Agent config dict without the LATER_AGENT_DEFAULTS (and its agent's LATER_AGENT_KEY_DEFAULTS) keys that are
+    at their default."""
+    later = dict(LATER_AGENT_DEFAULTS, **LATER_AGENT_KEY_DEFAULTS.get(agent_dict.get('agent_name'), {}))
+    return {k: v for k, v in agent_dict.items() if not (k in later and v == later[k])}
 
 
 def actor_params(agent):
