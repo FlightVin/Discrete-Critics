@@ -134,6 +134,37 @@ def test_interrupted_resume_identical(evals):
     assert sa == si
 
 
+SQ3 = '/data/user_data/vineethb/Discrete-Critics/geo/geo-sq3-qc-E10-model-prefix-fixed-label-s0'
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(SQ3, 'ckpt', 'LATEST')), reason='sq3 checkpoint not present')
+def test_measure_real_checkpoint(tmp_path):
+    """Wall time of every component on a real-size ARB-QC E10 checkpoint, 256 demo queries (one part each)."""
+    from test_geo4a_final_eval import _ckpt_hash
+    before = _ckpt_hash(SQ3)
+    env = dict(os.environ, XLA_PYTHON_CLIENT_PREALLOCATE='false')
+    p = subprocess.run([sys.executable, '-m', 'utils.arb_introspect', 'make_queries', '--n=256', '--seed=0',
+                        f'--out={tmp_path / "q0.npz"}'], cwd=REPO, env=env, capture_output=True, text=True, timeout=1200)
+    assert p.returncode == 0, p.stdout[-3000:] + p.stderr[-3000:]
+    q = dict(np.load(tmp_path / 'q0.npz'))
+    rs = np.random.RandomState(0)
+    np.savez(tmp_path / 'q.npz', **q, ref_value=rs.uniform(-60, -5, 256), ref_se=np.full(256, 0.5))
+    np.savez(tmp_path / 'cands.npz', observations=q['observations'][:32],
+             candidates=rs.uniform(-1, 1, (32, 32, 35)).astype(np.float32))
+    import time
+    t0 = time.time()
+    r = launch([*ENV, '--mode=arb_introspect', *QC, f'--src_run_dir={SQ3}', f'--run_dir={tmp_path / "out"}',
+                f'--queries={tmp_path / "q.npz"}', f'--candidates={tmp_path / "cands.npz"}'],
+               str(tmp_path / 'm.log'), str(tmp_path / 'm.flag'))
+    assert r['rc'] == 0, r['lines'][-40:]
+    assert _ckpt_hash(SQ3) == before
+    s = json.load(open(tmp_path / 'out' / 'arb_introspect.json'))
+    print('MEASURE wall_s', round(time.time() - t0, 1), 'queries 256, candidate states 32 x 32',
+          json.dumps({k: s[k] for k in ('trace', 'ablation', 'candidates')}),
+          json.dumps({k: s['forced'][k] for k in ('p1_e+1', 'p1_e-1')}),
+          json.dumps({k: s['labelfit'][k] for k in ('a_kl', 'b_kl', 'readout_value_abs_err_vs_y')}), sep='\n  ')
+
+
 def test_refusals_leave_source_unchanged(srcs, evals):
     d, _ = srcs
     cases = dict(inside=(QC, [f'--run_dir={d / "qc" / "x"}'], 'lies inside', None),
