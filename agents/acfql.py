@@ -28,8 +28,19 @@ class ACFQLAgent(flax.struct.PyTreeNode):
             batch_actions = batch["actions"][..., 0, :] # take the first action
         
         # TD loss
+        # critic_target_bon=True  → sample_actions (best-of-n for actor_type='best-of-n')
+        # critic_target_bon=False → single BC flow sample, no critic-based selection
         rng, sample_rng = jax.random.split(rng)
-        next_actions = self.sample_actions(batch['next_observations'][..., -1, :], rng=sample_rng)
+        next_obs = batch['next_observations'][..., -1, :]
+        if self.config['critic_target_bon']:
+            next_actions = self.sample_actions(next_obs, rng=sample_rng)
+        else:
+            action_dim = self.config['action_dim'] * (
+                self.config['horizon_length'] if self.config['action_chunking'] else 1
+            )
+            noises = jax.random.normal(sample_rng, (next_obs.shape[0], action_dim))
+            next_actions = self.compute_flow_actions(next_obs, noises)
+            next_actions = jnp.clip(next_actions, -1, 1)
 
         next_qs = self.network.select(f'target_critic')(batch['next_observations'][..., -1, :], actions=next_actions)
         if self.config['q_agg'] == 'min':
@@ -341,6 +352,7 @@ def get_config():
             action_chunking=True,  # False means n-step return
             actor_type="distill-ddpg",
             actor_num_samples=32,  # for actor_type="best-of-n" only
+            critic_target_bon=True,  # TD target next chunk: True = sample_actions; False = one BC flow sample
             use_fourier_features=False,
             fourier_feature_dim=64,
             weight_decay=0.,
