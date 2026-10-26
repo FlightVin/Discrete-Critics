@@ -33,6 +33,12 @@ Recipe (fixed before fitting):
     Timing: ms per update (mean of up to 50 timed updates after compilation) and ms per readout of
     32 x 256 (s, a) pairs (mean of 5 after compilation).
 Writes everything (and the variant's agent config) to --out as JSON.
+
+geo5b: --study adds res['study'] (controlled supervised study and exact-target diagnostic; see study()): same
+inputs, exact targets, matched budget (the training above is identical for every variant), no actor, no TD;
+held-out label fit / token accuracy / value error by group / forced-prefix recovery, boundary-code probes
+(boundary_probes()) with overshoot / undershoot prefixes and alternative redundant encodings, each under the normal
+readout and the correction ablation. --save_params keeps the trained critic params.
 """
 import argparse
 import json
@@ -72,29 +78,61 @@ GROUPS = ('base', 'k0', 'k19980', 'exact', 'boundary')
 OFFSETS = (-2, -1, 1, 2)
 
 
+def make_weights(rs=None):
+    rs = np.random.RandomState(123) if rs is None else rs
+    return rs.randn(64, OBS_DIM) / np.sqrt(OBS_DIM), rs.randn(1, 64) / np.sqrt(64)
+
+
+def recipe_targets(x, w1, w2):
+    """Targets k (int32) and groups of inputs x under the recipe of the module docstring."""
+    g = (np.tanh(x @ w1.T) @ w2.T)[:, 0]
+    s = 1.0 / (1.0 + np.exp(-3.0 * g))
+    k = np.round(K_TOP * s).astype(np.int64)
+    j = np.floor(999 * s).astype(np.int64)
+    p = sum((x[:, i] > 0).astype(np.int64) << i for i in range(4))
+    group = np.full(len(x), 'base', dtype=object)
+    k = np.where(p == 0, 0, k)
+    k = np.where(p == 1, K_TOP, k)
+    k = np.where((p == 2) | (p == 3), 20 * j, k)
+    k = np.where(p == 4, np.clip(20 * j + 1, 0, K_TOP), k)
+    k = np.where(p == 5, np.clip(20 * j - 1, 0, K_TOP), k)
+    group[p == 0], group[p == 1] = 'k0', 'k19980'
+    group[(p == 2) | (p == 3)], group[(p == 4) | (p == 5)] = 'exact', 'boundary'
+    return k.astype(np.int32), group
+
+
 def make_data():
     """(x_train, k_train, group_train), (x_test, k_test, group_test) as in the module docstring."""
     rs = np.random.RandomState(123)
-    w1 = rs.randn(64, OBS_DIM) / np.sqrt(OBS_DIM)
-    w2 = rs.randn(1, 64) / np.sqrt(64)
+    w1, w2 = make_weights(rs)
     xs = [rs.randn(N_TRAIN, OBS_DIM), rs.randn(N_TEST, OBS_DIM)]
-    out = []
-    for x in xs:
-        g = (np.tanh(x @ w1.T) @ w2.T)[:, 0]
-        s = 1.0 / (1.0 + np.exp(-3.0 * g))
-        k = np.round(K_TOP * s).astype(np.int64)
-        j = np.floor(999 * s).astype(np.int64)
-        p = sum((x[:, i] > 0).astype(np.int64) << i for i in range(4))
-        group = np.full(len(x), 'base', dtype=object)
-        k = np.where(p == 0, 0, k)
-        k = np.where(p == 1, K_TOP, k)
-        k = np.where((p == 2) | (p == 3), 20 * j, k)
-        k = np.where(p == 4, np.clip(20 * j + 1, 0, K_TOP), k)
-        k = np.where(p == 5, np.clip(20 * j - 1, 0, K_TOP), k)
-        group[p == 0], group[p == 1] = 'k0', 'k19980'
-        group[(p == 2) | (p == 3)], group[(p == 4) | (p == 5)] = 'exact', 'boundary'
-        out.append((x.astype(np.float32), k.astype(np.int32), group))
-    return out
+    return [(x.astype(np.float32), *recipe_targets(x, w1, w2)) for x in xs]
+
+
+# geo5b (7C): held-out exact-code probes at decimal boundaries. Fresh x ~ N(0, I) from RandomState(456)
+# (PROBE_DRAWS rows, disjoint from train / test draws), recipe targets; kept: exact codes (k % 20 == 0) whose code
+# n = k / 20 is in a boundary class, the first PROBE_PER_CLASS of each.
+PROBE_DRAWS, PROBE_PER_CLASS = 400000, 500
+PROBE_CLASSES = {'d00': lambda n: n % 100 == 0, 'd99': lambda n: n % 100 == 99,
+                 'd0': lambda n: (n % 10 == 0) & (n % 100 != 0), 'd9': lambda n: (n % 10 == 9) & (n % 100 != 99)}
+# Prefixes forced at the probes: overshoot / undershoot of position 1 or 2 (e = +-1, +-2, 0 = control) and other
+# redundant encodings of the same code (deltas on positions 1, 2; the exact final token then is
+# c3 - 100 d1 - 10 d2).
+ENCODINGS = {'enc_0_0': (2, (0, 0)), 'enc_0_-1': (2, (0, -1)), 'enc_0_+1': (2, (0, 1)), 'enc_0_-2': (2, (0, -2)),
+             'enc_-1_+10': (2, (-1, 10)), 'enc_+1_-10': (2, (1, -10)), 'enc_-1_+9': (2, (-1, 9))}
+
+
+def boundary_probes():
+    w1, w2 = make_weights()
+    x = np.random.RandomState(456).randn(PROBE_DRAWS, OBS_DIM)
+    k, _ = recipe_targets(x, w1, w2)
+    xs, ks, cls = [], [], []
+    for name, f in PROBE_CLASSES.items():
+        idx = np.nonzero((k % 20 == 0) & f(k // 20))[0][:PROBE_PER_CLASS]
+        xs.append(x[idx])
+        ks.append(k[idx])
+        cls += [name] * len(idx)
+    return np.concatenate(xs).astype(np.float32), np.concatenate(ks).astype(np.int32), np.array(cls, dtype=object)
 
 
 def make_agent(variant):
@@ -230,23 +268,112 @@ def evaluate(agent, x, k, group):
     return out
 
 
+def _mean_by(values, groups, names):
+    """{name: mean over rows of that group (axis 0)} as lists / floats, plus 'all'."""
+    out = {'all': np.nanmean(values, 0).tolist()}
+    for g in names:
+        m = groups == g
+        out[g] = np.nanmean(values[m], 0).tolist() if m.any() else None
+    return out
+
+
+def study(agent, x, k, group, n_forced):
+    """geo5b controlled supervised study (sections 7C / 8), on the held-out set (x, k, group) and the boundary
+    probes. Keys (chunks of CHUNK rows, chunk c): label roll-in fold_in(PRNGKey(8), c), model readout
+    fold_in(PRNGKey(9), c); forced prefixes PRNGKey(10) (one key for every prefix: paired). Normal readout and the
+    correction ablation (tokens < 0 or > 9 masked before sampling: an inference intervention) side by side.
+      labelfit[readout]: per-position CE / H / KL (method labels q vs p, target-derived prefixes 'a_' and
+        model-generated prefixes 'b_'), KL(q*||p), token-mean error (and x 10^-l), clean-target mass, teacher-forced
+        accuracy a_tf_acc (argmax p == argmax q), model-generated token accuracy b_token_ok (sampled token in the
+        support of the clean corrective two-hot given its own prefix), by group;
+      value[readout]: held-out bias / MAE by group and exact-code fraction;
+      forced[readout]: forced-prefix recovery (p in {1, 2}, e in -2..2) on the first n_forced held-out rows;
+      probes[readout]: per boundary class (d00 / d99 / d0 / d9 codes) unforced value MAE, exact-code fraction and
+        forced recovery for the (p, e) grid and the alternative encodings (ENCODINGS), with per-token exact mass
+        p(z_{p+1} = r) at the next position."""
+    from utils import arb_introspect as AI
+    u = k.astype(np.float64) / K_DEN
+    act = lambda n: jnp.zeros((n, H * ADIM), jnp.float32)  # noqa: E731
+    out = {}
+    for ablate in (False, True):
+        name = 'ablated' if ablate else 'normal'
+        parts = []
+        for c, s in enumerate(range(0, len(x), CHUNK)):
+            sl = slice(s, s + CHUNK)
+            kk = jnp.asarray(k[sl])
+            lf = AI.label_fit_k(agent, jnp.asarray(x[sl]), act(len(x[sl])), kk.astype(jnp.float32) / K_DEN, kk,
+                                jax.random.fold_in(jax.random.PRNGKey(8), c), jax.random.fold_in(jax.random.PRNGKey(9), c),
+                                ablate=ablate)
+            parts.append({kq: v for kq, v in lf.items() if kq != 'label_mode'})
+        lf = {kq: np.concatenate([p[kq] for p in parts]) for kq in parts[0]}
+        stats = {}
+        for kq, v in lf.items():
+            if kq.startswith(('a_', 'b_')):
+                if ablate and kq.startswith('a_'):
+                    continue  # target-derived prefixes do not depend on the readout
+                stats[kq] = _mean_by(v, group, GROUPS)
+                if kq.endswith('tok_mean_err'):
+                    stats[kq + '_abs_scaled'] = _mean_by(np.abs(v) * AI.POS_SCALE, group, GROUPS)
+        err = lf['readout_value'].astype(np.float64) - u
+        out.setdefault('labelfit', {})[name] = stats
+        out.setdefault('value', {})[name] = {'bias': _mean_by(err, group, GROUPS),
+                                             'mae': _mean_by(np.abs(err), group, GROUPS),
+                                             'exact_code_frac': _mean_by(lf['exact_code_frac'], group, GROUPS)}
+        key = jax.random.PRNGKey(10)
+        fr = AI.forced_recovery(agent, jnp.asarray(x[:n_forced]), act(n_forced), key, u[:n_forced], ablate=ablate)
+        out.setdefault('forced', {})[name] = AI.forced_summary(agent, fr)
+
+        px, pk, pcls = boundary_probes()
+        pu = pk.astype(np.float64) / K_DEN
+        probes = {}
+        for cname in PROBE_CLASSES:
+            m = pcls == cname
+            if not m.any():
+                continue
+            o, a = jnp.asarray(px[m]), act(int(m.sum()))
+            tr = AI.trace(agent, o, a, key, ablate=ablate, with_probs=False)
+            n = np.asarray(tr['n'])
+            spec = dict({f'p{p}_e{e:+d}': (p, (0,) * (p - 1) + (e,)) for p in (1, 2) for e in AI.OFFSETS},
+                        **ENCODINGS)
+            fr = AI.forced_recovery(agent, o, a, key, pu[m], ablate=ablate, prefixes=spec)
+            probes[cname] = {'n': int(m.sum()),
+                             'mae': float(np.abs(np.asarray(tr['value'], np.float64) - pu[m]).mean()),
+                             'exact_code_frac': float((n == np.round(pu[m] * 1000)[None, :, None]).mean()),
+                             'forced': AI.forced_summary(agent, fr)}
+        out.setdefault('probes', {})[name] = probes
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--variant', required=True, choices=sorted(VARIANTS))
     p.add_argument('--out', required=True)
     p.add_argument('--updates', type=int, default=20000)
+    p.add_argument('--study', action='store_true', help='geo5b: add the controlled supervised study (study()).')
+    p.add_argument('--study_forced', type=int, default=2000, help='held-out rows for forced-prefix recovery.')
+    p.add_argument('--save_params', default=None, help='pickle the trained critic params here.')
     args = p.parse_args()
+    if args.study and args.variant == 'E0':
+        p.error('--study needs the sample_mean readout (E1-E11)')
 
     (x_tr, k_tr, _), (x_te, k_te, g_te) = make_data()
     agent = make_agent(args.variant)
     agent, train_info, ms_update = train(agent, x_tr, k_tr, args.updates)
+    if args.save_params:
+        import pickle
+        with open(args.save_params, 'wb') as f:
+            pickle.dump(jax.device_get(agent.network.params['modules_critic']), f)
     res = {'variant': args.variant, 'updates': args.updates, 'ms_per_update': ms_update,
            'train_last100': train_info, **evaluate(agent, x_te, k_te, g_te),
            'config': json.loads(json.dumps(dict(agent.config), default=str))}
+    if args.study:
+        t0 = time.perf_counter()
+        res['study'] = study(agent, x_te, k_te, g_te, args.study_forced)
+        res['study_s'] = time.perf_counter() - t0
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, 'w') as f:
         json.dump(res, f, indent=1)
-    print(json.dumps({k: v for k, v in res.items() if k != 'config'}), flush=True)
+    print(json.dumps({k: v for k, v in res.items() if k not in ('config', 'study')}), flush=True)
 
 
 if __name__ == '__main__':
