@@ -46,6 +46,9 @@ def go(name, args):
     return r
 
 
+@pytest.mark.skipif(not os.environ.get('GEO5A_MEASURE'),
+                    reason='opt-in (GEO5A_MEASURE=1): 32 toolhang env workers, ~5 min; OOM-killed inside the full '
+                           'suite on a shared 31 GiB cgroup')
 @pytest.mark.skipif(not os.path.exists(os.path.join(TH, 'ckpt', 'LATEST')), reason='th3 checkpoint not present')
 def test_measure_toolhang():
     shutil.rmtree(SCRATCH, ignore_errors=True)
