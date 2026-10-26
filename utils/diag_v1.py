@@ -6,7 +6,8 @@ Env stack (envs.env_utils.make_vectorized_eval_envs): EpisodeMonitor -> Robomimi
 snapshot(env, obs) captures everything that determines the future of env.step:
   mj        MuJoCo integration state (mj_getState(mjSTATE_INTEGRATION): time, qpos, qvel, act, qacc_warmstart,
             ctrl, applied forces, mocap, eq_active, userdata, plugin state). robomimic's get_state() keeps only
-            (time, qpos, qvel); the warm start alone changes the next steps by ~1e-10..1e-6 (see the tests).
+            (time, qpos, qvel): its reset_to({'states'}) replays differ by ~2e-2 in the observation after 8 steps,
+            restore() replays bit-identically (tests/test_geo5a_restore.py).
   sim_state robomimic get_state()['states'] (for the record; restore uses mj).
   py        python-side state of every robosuite object reachable from the robosuite env (controllers, grippers,
             observables with their sampling clocks and cached values, timestep / cur_time, obs cache): every
