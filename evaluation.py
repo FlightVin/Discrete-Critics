@@ -182,6 +182,7 @@ def evaluate_parallel(
     eval_episodes,
     action_dim,
     return_episodes=False,
+    on_reset=None,
 ):
     """Evaluate the agent using a vectorized (parallel) environment.
 
@@ -192,6 +193,7 @@ def evaluate_parallel(
         eval_episodes: Number of complete episodes to run per environment.
         action_dim: Per-step action dimension.
         return_episodes: also return per-episode results (see Returns).
+        on_reset: if given, called with no arguments right after each envs.reset().
 
     Returns:
         A tuple (stats, [], []) compatible with the sequential evaluate() signature. With return_episodes:
@@ -210,6 +212,8 @@ def evaluate_parallel(
 
     for rollout_idx in range(eval_episodes):
         observations, _ = envs.reset()
+        if on_reset is not None:
+            on_reset()
         if return_episodes:
             first_obs.append(np.array(observations))
 
