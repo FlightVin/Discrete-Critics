@@ -21,6 +21,10 @@
                  of --n_eval_envs; each (rule, chunk) is written to <run_dir>/final_eval_parts/ (a restart skips
                  the parts present; a preemption notice exits 143 after the last complete part), then
                  <run_dir>/final_eval.json. W&B only with --project_name.
+  --mode=switch_eval  as final_eval (same source checks, seeds, chunks, RNG, parts / resume, preemption exit),
+                 but each setting (--switch_order, k in --switch_ks) uses a hybrid rule: bon_first: decisions
+                 d < k (policy calls since the episode's reset) use bon, d >= k n1; n1_first: the reverse. Parts
+                 <run_dir>/switch_eval_parts/{order}_{k}_{c}.json, then <run_dir>/switch_eval.json. No W&B.
   --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
                  --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
                  fresh optimisers; then phases
@@ -90,13 +94,14 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
                                       'final_eval', 'arb_introspect', 'diag_anchors', 'diag_mc', 'diag_score',
-                                      'diag_select'],
+                                      'diag_select', 'switch_eval'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
                   'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
                   'committed checkpoint of a finished --src_run_dir (read-only); arb_introspect: AR-B critic '
                   'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b); '
-                  'diag_*: geo5a diagnostics of a finished --src_run_dir (read-only), see diag_main.')
+                  'diag_*: geo5a diagnostics of a finished --src_run_dir (read-only), see diag_main; '
+                  'switch_eval: final_eval with bon for the first k decisions then n1 (or the reverse, geo8a).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -128,6 +133,9 @@ flags.DEFINE_string('src_run_dir', None, 'probe_ckpt / final_eval: run directory
                     'probed / evaluated (read-only).')
 flags.DEFINE_integer('final_seed_base', 100000, 'final_eval: env seed j is final_seed_base + j.')
 flags.DEFINE_integer('final_n_seeds', 256, 'final_eval: env seeds (a multiple of --n_eval_envs).')
+flags.DEFINE_enum('switch_order', 'bon_first', ['bon_first', 'n1_first'], 'switch_eval: bon_first: bon for '
+                  'decisions d < k then n1; n1_first: n1 for d < k then bon.')
+flags.DEFINE_list('switch_ks', ['0'], 'switch_eval: comma list of switch decisions k (one setting each).')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
 flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py); diag_mc / diag_score: '
                     'query file (anchors.pkl or select_queries.pkl); diag_select: the common-panel anchors.pkl.')
@@ -1367,8 +1375,9 @@ def final_eval_chunk_seed(c):
     return int(np.random.SeedSequence([FLAGS.final_seed_base, c]).generate_state(1)[0])
 
 
-def final_eval():
-    """--mode=final_eval: n1 and bon on the agent of --src_run_dir's committed checkpoint -> final_eval.json."""
+def final_eval(runner=None):
+    """--mode=final_eval: n1 and bon on the agent of --src_run_dir's committed checkpoint -> final_eval.json.
+    runner: run_switch_eval for --mode=switch_eval (same source checks and loading; no W&B)."""
     assert FLAGS.src_run_dir, '--src_run_dir is required'
     src, out_dir = os.path.realpath(FLAGS.src_run_dir), os.path.realpath(FLAGS.run_dir)
     if src == out_dir or out_dir.startswith(src + os.sep):
@@ -1392,12 +1401,12 @@ def final_eval():
         if diff:
             refuse('config differs from the source run (source, this call): ' + json.dumps(diff, default=str))
         tr.agent = flax.serialization.from_state_dict(tr.agent, state['agent'])
-        out = run_final_eval(tr, src, state, man, n_seeds, C, E)
+        out = (runner or run_final_eval)(tr, src, state, man, n_seeds, C, E)
     except SystemExit:
         raise
     except BaseException:
         exit_on_exception(tr)
-    if FLAGS['project_name'].present:
+    if runner is None and FLAGS['project_name'].present:
         import wandb
         import secrets
         tr.wandb_id = secrets.token_hex(6)  # its own W&B run
@@ -1512,6 +1521,142 @@ def run_final_eval(tr, src, state, man, n_seeds, C, E):
     for rule in ('n1', 'bon'):
         summary[rule] = {k: v for k, v in out[rule].items() if not k.startswith('per_')}
     print('FINAL_EVAL ' + json.dumps(summary, default=str), flush=True)
+    return out
+
+
+class _AlignedEnvs:
+    """evaluate_parallel's envs, tracking the active envs and the steps since reset, so a policy call can check
+    that it was asked for chunks of exactly the active envs (all reset together, H steps per chunk)."""
+
+    def __init__(self, envs, n):
+        self.envs, self.n = envs, n
+
+    def reset(self):
+        self.obs, info = self.envs.reset()
+        self.active, self.t = np.ones(self.n, dtype=bool), 0
+        return self.obs, info
+
+    def step(self, actions):
+        out = self.envs.step(actions)
+        self.obs, self.t = out[0], self.t + 1
+        self.active &= ~np.logical_or(out[2], out[3])
+        return out
+
+    def check_call(self, observations, d, H):
+        a = int(self.active.sum())
+        ok = (self.t == d * H and a > 0 and np.array_equal(observations[:a], self.obs[self.active])
+              and not np.any(observations[a:]))
+        if not ok:
+            raise RuntimeError(f'switch_eval alignment broken at decision {d}: t={self.t} active={a}')
+
+
+def run_switch_eval(tr, src, state, man, n_seeds, C, E):
+    """switch_eval settings (order, k) on run_final_eval's seeds / chunks / RNG -> switch_eval.json."""
+    import functools
+    order = FLAGS.switch_order
+    ks = [int(k) for k in FLAGS.switch_ks]
+    first, then = (bon_actions, n1_actions) if order == 'bon_first' else (n1_actions, bon_actions)
+    parts_dir = os.path.join(FLAGS.run_dir, 'switch_eval_parts')
+    os.makedirs(parts_dir, exist_ok=True)
+    tr.eval_envs = None
+    action_dim, H = tr.config['action_dim'], FLAGS.horizon_length
+    n_chunks = n_seeds // C
+    ident = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, n_eval_envs=C,
+                 eval_episodes=E)
+    parts, done = {}, 0
+
+    def exit_preempted():
+        tr.close_envs()
+        dt = time.time() - tr.t_stop_ref
+        print(f'EXIT_PREEMPTED source={tr.stop_source} notice_to_exit_s={dt:.2f} phase=switch_eval '
+              f'parts_done={done}', flush=True)
+        sys.exit(EXIT_PREEMPTED)
+
+    for k in ks:
+        for c in range(n_chunks):
+            path = os.path.join(parts_dir, f'{order}_{k}_{c}.json')
+            seeds = [FLAGS.final_seed_base + c * C + i for i in range(C)]
+            if os.path.exists(path):
+                with open(path) as f:
+                    part = json.load(f)
+                got = {x: part.get(x) for x in (*ident, 'order', 'k')}
+                if got != dict(ident, order=order, k=k) or part['seeds'] != seeds:
+                    tr.close_envs()
+                    refuse(f'{path} was written with other settings: ' + json.dumps(got))
+                print(f'SWITCH_EVAL_PART_SKIP order={order} k={k} chunk={c}', flush=True)
+                parts[k, c] = part
+                done += 1
+                continue
+            if tr.watcher is not None:
+                tr.watcher.check()
+            if tr.stop_requested:
+                exit_preempted()
+            if tr.eval_envs is None:
+                np_state = np.random.get_state()  # robomimic's make_env reseeds numpy (as in setup)
+                tr.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, C, seed=FLAGS.final_seed_base)
+                np.random.set_state(np_state)
+            t0 = time.time()
+            envs = _AlignedEnvs(tr.eval_envs, C)
+            calls = dict(d=0, bon=0, n1=0, rules=[])  # rules: per episode, the rule of each decision (b / n)
+
+            def on_reset(calls=calls):
+                calls['d'] = 0
+                calls['rules'].append('')
+
+            def act(observations, rng, k=k, envs=envs, calls=calls):
+                if tr.stop_requested:
+                    raise EvalAborted()
+                envs.check_call(observations, calls['d'], H)
+                fn = first if calls['d'] < k else then
+                rule = 'bon' if fn is bon_actions else 'n1'
+                calls[rule] += 1
+                calls['rules'][-1] += rule[0]
+                calls['d'] += 1
+                return fn(tr.agent, observations, rng)
+
+            tr.eval_envs.set_attr('v1_reseed', [functools.partial(_seed_numpy, s) for s in seeds])
+            tr.eval_envs.call('v1_reseed')
+            np.random.seed(final_eval_chunk_seed(c))
+            try:
+                _, _, _, eps = evaluate_parallel(agent=Policy(act), envs=envs, num_eval_envs=C, eval_episodes=E,
+                                                 action_dim=action_dim, return_episodes=True, on_reset=on_reset)
+            except EvalAborted:
+                print(f'EVAL_ABORTED ({tr.stop_source}) order={order} k={k} chunk={c}', flush=True)
+                exit_preempted()
+            assert len(calls['rules']) == E, calls['rules']
+            part = dict(ident, order=order, k=k, chunk=c, seeds=seeds, success=eps['success'].astype(int).tolist(),
+                        length=eps['length'].tolist(), n_bon_calls=calls['bon'], n_n1_calls=calls['n1'],
+                        call_rules=calls['rules'], wall_s=time.time() - t0)
+            write_atomic(path, (json.dumps(part) + '\n').encode())
+            parts[k, c] = part
+            done += 1
+            print(f'SWITCH_EVAL_PART order={order} k={k} chunk={c} successes={int(np.sum(part["success"]))}/{C * E} '
+                  f'n_bon_calls={calls["bon"]} n_n1_calls={calls["n1"]} wall_s={part["wall_s"]:.1f}', flush=True)
+    tr.close_envs()
+
+    ctr = dict(state['ctr'])
+    out = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], mode=state.get('mode'), ctr=ctr,
+               step=int(ctr.get('env_steps', 0) or ctr.get('bc_updates', 0)), env_name=FLAGS.env_name,
+               horizon_length=FLAGS.horizon_length, method=FLAGS.method, agent_name=tr.config['agent_name'],
+               agent=strip_later_agent_defaults(tr.config.to_dict()), final_seed_base=FLAGS.final_seed_base,
+               seeds=[FLAGS.final_seed_base + j for j in range(n_seeds)], n_eval_envs=C, eval_episodes=E,
+               switch_order=order, switch_ks=ks, wall_s=float(sum(p['wall_s'] for p in parts.values())),
+               settings=[])
+    for k in ks:
+        S = np.concatenate([np.asarray(parts[k, c]['success'], dtype=np.int64) for c in range(n_chunks)])
+        L = np.concatenate([np.asarray(parts[k, c]['length'], dtype=np.int64) for c in range(n_chunks)])
+        s, n = int(S.sum()), int(S.size)
+        out['settings'].append(dict(
+            order=order, k=k, successes=s, episodes=n, success_rate=s / n, wilson95=wilson_ci(s, n),
+            n_bon_calls=sum(parts[k, c]['n_bon_calls'] for c in range(n_chunks)),
+            n_n1_calls=sum(parts[k, c]['n_n1_calls'] for c in range(n_chunks)),
+            per_seed_successes=S.sum(1).tolist(), per_episode_success=S.tolist(), per_episode_length=L.tolist()))
+    write_atomic(os.path.join(FLAGS.run_dir, 'switch_eval.json'),
+                 (json.dumps(out, indent=1, default=str) + '\n').encode())
+    for r in out['settings']:
+        line = {x: v for x, v in r.items() if not x.startswith('per_')}
+        line.update(src_run_dir=src, gen=man['gen'])
+        print('SWITCH_EVAL ' + json.dumps(line, default=str), flush=True)
     return out
 
 
@@ -2065,6 +2210,9 @@ def main(_):
         return
     if FLAGS.mode == 'final_eval':
         final_eval()
+        return
+    if FLAGS.mode == 'switch_eval':
+        final_eval(runner=run_switch_eval)
         return
     if FLAGS.mode.startswith('diag_'):
         diag_main()
