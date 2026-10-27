@@ -46,9 +46,10 @@ def get_max_episode_length(env_name):
         raise ValueError(f"Unsupported environment: {env_name}")
 
 
-def make_env(env_name, seed=0):
+def make_env(env_name, seed=0, render_offscreen=False):
     """
     NOTE: should get_dataset() first, so that the metadata is downloaded before creating the environment
+    render_offscreen: create the offscreen renderer (env.render(mode="rgb_array")); observations unchanged.
     """
     # _download_dataset_and_metadata(env_name)
     dataset_path = _check_dataset_exists(env_name)
@@ -59,7 +60,7 @@ def make_env(env_name, seed=0):
     env = EnvUtils.create_env_from_metadata(
         env_meta=env_meta,
         render=False, 
-        render_offscreen=False,
+        render_offscreen=render_offscreen,
     )
     env = RobomimicLowdimWrapper(env, low_dim_keys=low_dim_keys["low_dim"], max_episode_length=max_episode_length)
     env.seed(seed)

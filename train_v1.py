@@ -25,6 +25,12 @@
                  but each setting (--switch_order, k in --switch_ks) uses a hybrid rule: bon_first: decisions
                  d < k (policy calls since the episode's reset) use bon, d >= k n1; n1_first: the reverse. Parts
                  <run_dir>/switch_eval_parts/{order}_{k}_{c}.json, then <run_dir>/switch_eval.json. No W&B.
+  --mode=episode_stages  as final_eval (same source checks and loading): per rule (n1, bon) and env seed
+                 final_seed_base + j, j < --stage_n_seeds, ONE episode in a single env (initial state as
+                 final_eval's first episode of that seed) with per-step task-stage codes (tool hang: 0 none,
+                 1 frame assembled, 2 frame assembled + tool on frame; other tasks: 2 = success). Parts
+                 <run_dir>/episode_stages_parts/{rule}_{j}.json, then <run_dir>/episode_stages.json; videos of
+                 j < --video_n_seeds in <run_dir>/videos/ (geo8b). No W&B.
   --mode=online  --method (qc | bsc | arb_bsc | arb_qc | cat | hlg) selects agents.v1_config(method);
                  --agent.* overrides apply on top. Agent created with --seed, actor replaced by --init_actor,
                  fresh optimisers; then phases
@@ -94,14 +100,15 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
                                       'final_eval', 'arb_introspect', 'diag_anchors', 'diag_mc', 'diag_score',
-                                      'diag_select', 'switch_eval'],
+                                      'diag_select', 'switch_eval', 'episode_stages'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
                   'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
                   'committed checkpoint of a finished --src_run_dir (read-only); arb_introspect: AR-B critic '
                   'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b); '
                   'diag_*: geo5a diagnostics of a finished --src_run_dir (read-only), see diag_main; '
-                  'switch_eval: final_eval with bon for the first k decisions then n1 (or the reverse, geo8a).')
+                  'switch_eval: final_eval with bon for the first k decisions then n1 (or the reverse, geo8a); '
+                  'episode_stages: per-step task stages + videos of single n1 / bon episodes (geo8b).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -136,6 +143,10 @@ flags.DEFINE_integer('final_n_seeds', 256, 'final_eval: env seeds (a multiple of
 flags.DEFINE_enum('switch_order', 'bon_first', ['bon_first', 'n1_first'], 'switch_eval: bon_first: bon for '
                   'decisions d < k then n1; n1_first: n1 for d < k then bon.')
 flags.DEFINE_list('switch_ks', ['0'], 'switch_eval: comma list of switch decisions k (one setting each).')
+flags.DEFINE_integer('stage_n_seeds', 16, 'episode_stages: env seeds final_seed_base + j, j < this.')
+flags.DEFINE_integer('video_n_seeds', 2, 'episode_stages: write videos for the first this many seeds.')
+flags.DEFINE_integer('video_hw', 160, 'episode_stages: video frame height and width.')
+flags.DEFINE_integer('video_stride', 4, 'episode_stages: env steps per video frame.')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
 flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py); diag_mc / diag_score: '
                     'query file (anchors.pkl or select_queries.pkl); diag_select: the common-panel anchors.pkl.')
@@ -196,7 +207,8 @@ LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'r
                        'diag_seed': 0, 'diag_rule': 'n1', 'diag_n_seeds': 32, 'diag_episodes': 4, 'anchors': 32,
                        'policy_ckpt': None, 'mc_k': 32, 'mc_seed': 0, 'mc_t_extra': 757,
                        'mc_part_size': 8, 'continuation': 'n1', 'diag_contract': 'auto', 'sel_seed': 0,
-                       'mc_candidates': 0, 'score_keys': 5, 'switch_order': 'bon_first', 'switch_ks': ['0']}
+                       'mc_candidates': 0, 'score_keys': 5, 'switch_order': 'bon_first', 'switch_ks': ['0'],
+                       'stage_n_seeds': 16, 'video_n_seeds': 2, 'video_hw': 160, 'video_stride': 4}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
@@ -1660,6 +1672,170 @@ def run_switch_eval(tr, src, state, man, n_seeds, C, E):
     return out
 
 
+def run_episode_stages(tr, src, state, man, *_):
+    """--mode=episode_stages (geo8b): one episode per (rule, env seed final_seed_base + j) in a single env, as
+    final_eval's actions (one H-step chunk per decision, the env's step limit), recording the task-stage code
+    after every env step; videos for j < --video_n_seeds. -> episode_stages.json (resumable per (rule, j) part)."""
+    import imageio
+    import mujoco
+    from PIL import Image, ImageDraw
+    from envs.robomimic_utils import make_env
+    try:
+        import imageio_ffmpeg  # noqa: F401
+        ext = 'mp4'
+    except ImportError:
+        ext = 'gif'
+    parts_dir, vid_dir = os.path.join(FLAGS.run_dir, 'episode_stages_parts'), os.path.join(FLAGS.run_dir, 'videos')
+    os.makedirs(parts_dir, exist_ok=True)
+    os.makedirs(vid_dir, exist_ok=True)
+    action_dim, H, n_seeds = tr.config['action_dim'], FLAGS.horizon_length, FLAGS.stage_n_seeds
+    hw, stride, fps = FLAGS.video_hw, FLAGS.video_stride, 15
+    labels = dict(n1='N1', bon=f'BO{tr.config["actor_num_samples"]}')
+    ident = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, video_hw=hw,
+                 video_stride=stride)
+    env, parts, done = None, {}, 0
+
+    def stage_code(sim):
+        """tool hang: robosuite ToolHang._check_frame_assembled / _check_tool_on_frame; else 2 iff success."""
+        if hasattr(sim, '_check_frame_assembled'):
+            fa = bool(sim._check_frame_assembled())
+            return 2 if fa and sim._check_tool_on_frame() else int(fa)
+        return 2 * int(bool(sim._check_success()))
+
+    def write_video(path, frames):
+        tmp = f'{path[:-len(ext) - 1]}.tmp.{ext}'
+        for q in (5, 3, 1):  # keep each file <= 400 KB
+            if ext == 'mp4':
+                imageio.v2.mimwrite(tmp, frames, format='FFMPEG', fps=fps, codec='libx264', quality=q,
+                                    pixelformat='yuv420p', macro_block_size=16)
+            else:
+                imageio.v2.mimwrite(tmp, frames[::2], duration=2000 / fps, loop=0)
+            if os.path.getsize(tmp) <= 400_000:
+                break
+        os.replace(tmp, path)
+
+    def exit_preempted():
+        if env is not None:
+            env.close()
+        dt = time.time() - tr.t_stop_ref
+        print(f'EXIT_PREEMPTED source={tr.stop_source} notice_to_exit_s={dt:.2f} phase=episode_stages '
+              f'parts_done={done}', flush=True)
+        sys.exit(EXIT_PREEMPTED)
+
+    for rule in ('n1', 'bon'):
+        fn = n1_actions if rule == 'n1' else bon_actions
+        for j in range(n_seeds):
+            seed = FLAGS.final_seed_base + j
+            path = os.path.join(parts_dir, f'{rule}_{j}.json')
+            if os.path.exists(path):
+                with open(path) as f:
+                    part = json.load(f)
+                if {k: part.get(k) for k in ident} != ident or part['seed'] != seed:
+                    refuse(f'{path} was written with other settings: ' + json.dumps({k: part.get(k) for k in ident}))
+                print(f'EPISODE_STAGES_PART_SKIP rule={rule} seed={seed}', flush=True)
+                parts[rule, j] = part
+                done += 1
+                continue
+            if tr.watcher is not None:
+                tr.watcher.check()
+            if tr.stop_requested:
+                exit_preempted()
+            video = j < FLAGS.video_n_seeds
+            if env is None:
+                np_state = np.random.get_state()  # robomimic's make_env reseeds numpy
+                env = make_env(FLAGS.env_name, seed=FLAGS.final_seed_base)
+                np.random.set_state(np_state)
+            sim = env.env.env  # RobomimicLowdimWrapper -> robomimic EnvRobosuite -> robosuite env
+            t0 = time.time()
+            np.random.seed(seed)  # as final_eval's _seed_numpy before the seed's first reset
+            obs, _ = env.reset()
+            digest = hashlib.sha256(np.ascontiguousarray(obs, dtype=np.float64).tobytes()).hexdigest()[:16]
+            rng = jax.random.PRNGKey(seed)  # the same actor noise stream for both rules
+            codes, frames, success, t, decisions = [], [], 0, 0, 0
+
+            if video:  # robosuite's own offscreen renderer returns corrupted frames once build_agent_trainer has
+                # made and closed its envs; mujoco.Renderer (own EGL context, made current per render) does not
+                renderer = mujoco.Renderer(sim.sim.model._model, hw, hw)
+                scene_opt = mujoco.MjvOption()
+                scene_opt.geomgroup[0] = 0  # collision geoms hidden, as robosuite's renderer
+
+            def frame():
+                renderer.update_scene(sim.sim.data._data, camera='agentview', scene_option=scene_opt)
+                im = Image.fromarray(renderer.render())
+                ImageDraw.Draw(im).text((3, 2), f'{labels[rule]} t={t} stage={codes[-1] if codes else 0}',
+                                        fill=(255, 255, 0))
+                frames.append(np.asarray(im))
+
+            if video:
+                frame()
+            end = False
+            while not end:
+                if tr.stop_requested:
+                    print(f'EVAL_ABORTED ({tr.stop_source}) rule={rule} seed={seed}', flush=True)
+                    exit_preempted()
+                rng, key = jax.random.split(rng)
+                chunk = np.asarray(fn(tr.agent, obs[None], key)).reshape(-1, action_dim)
+                decisions += 1
+                for a in chunk[:H]:
+                    obs, _, term, trunc, info = env.step(a)
+                    t += 1
+                    codes.append(stage_code(sim))
+                    end = term or trunc
+                    if video and (t % stride == 0 or end):
+                        frame()
+                    if end:
+                        success = int(info['success'])
+                        break
+            c = np.asarray(codes)
+            first = {s: (int(np.argmax(c >= s)) + 1 if np.any(c >= s) else None) for s in (1, 2)}
+            vpath = None
+            if video:
+                renderer.close()
+                vpath = os.path.join(vid_dir, f'{rule}_seed{seed}.{ext}')
+                write_video(vpath, frames)
+            part = dict(ident, rule=rule, seed=seed, success=success, length=t, decisions=decisions,
+                        first_stage1_step=first[1], first_stage2_step=first[2],
+                        steps_at_stage=[int(np.sum(c == s)) for s in range(3)],
+                        stage_per_decision=[int(c[min((d + 1) * H, t) - 1]) for d in range(decisions)],
+                        first_obs_digest=digest, video=vpath, wall_s=time.time() - t0)
+            write_atomic(path, (json.dumps(part) + '\n').encode())
+            parts[rule, j] = part
+            done += 1
+            print(f'EPISODE_STAGES_PART rule={rule} seed={seed} success={success} length={t} '
+                  f'stage1={first[1]} stage2={first[2]} wall_s={part["wall_s"]:.1f}', flush=True)
+    if env is not None:
+        env.close()
+
+    for j in range(min(FLAGS.video_n_seeds, n_seeds)):  # N1 left, BO-n right; the shorter padded with its last frame
+        seed = FLAGS.final_seed_base + j
+        path = os.path.join(vid_dir, f'side_by_side_seed{seed}.{ext}')
+        if os.path.exists(path):
+            continue
+        a, b = (imageio.v2.mimread(parts[r, j]['video'], memtest=False) for r in ('n1', 'bon'))
+        n = max(len(a), len(b))
+        a, b = (v + [v[-1]] * (n - len(v)) for v in (a, b))
+        write_video(path, [np.concatenate([x[..., :3], y[..., :3]], axis=1) for x, y in zip(a, b)])
+
+    ctr = dict(state['ctr'])
+    out = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], mode=state.get('mode'), ctr=ctr,
+               env_name=FLAGS.env_name, horizon_length=H, method=FLAGS.method, agent_name=tr.config['agent_name'],
+               agent=strip_later_agent_defaults(tr.config.to_dict()), final_seed_base=FLAGS.final_seed_base,
+               stage_n_seeds=n_seeds, video_n_seeds=FLAGS.video_n_seeds, video_hw=hw, video_stride=stride,
+               stage_codes={0: 'none', 1: 'frame assembled', 2: 'frame assembled + tool on frame (success)'},
+               episodes=[parts[r, j] for r in ('n1', 'bon') for j in range(n_seeds)], summary={})
+    for rule in ('n1', 'bon'):
+        eps = [parts[rule, j] for j in range(n_seeds)]
+        s1 = [e['first_stage1_step'] for e in eps if e['first_stage1_step'] is not None]
+        out['summary'][rule] = dict(episodes=len(eps), successes=sum(e['success'] for e in eps),
+                                    reached_stage1=len(s1),
+                                    median_first_stage1_step=float(np.median(s1)) if s1 else None,
+                                    mean_length=float(np.mean([e['length'] for e in eps])))
+    write_atomic(os.path.join(FLAGS.run_dir, 'episode_stages.json'),
+                 (json.dumps(out, indent=1, default=str) + '\n').encode())
+    print('EPISODE_STAGES ' + json.dumps(out['summary']), flush=True)
+    return out
+
+
 def arb_introspect():
     """--mode=arb_introspect: utils/arb_introspect.run_mode on the agent of --src_run_dir's committed checkpoint
     (read-only, any phase), the agent built from the query file's shapes (no env, no dataset). Config checked
@@ -2213,6 +2389,9 @@ def main(_):
         return
     if FLAGS.mode == 'switch_eval':
         final_eval(runner=run_switch_eval)
+        return
+    if FLAGS.mode == 'episode_stages':
+        final_eval(runner=run_episode_stages)
         return
     if FLAGS.mode.startswith('diag_'):
         diag_main()
