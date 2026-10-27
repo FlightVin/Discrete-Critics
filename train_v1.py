@@ -1676,6 +1676,7 @@ def run_episode_stages(tr, src, state, man, *_):
     final_eval's actions (one H-step chunk per decision, the env's step limit), recording the task-stage code
     after every env step; videos for j < --video_n_seeds. -> episode_stages.json (resumable per (rule, j) part)."""
     import imageio
+    import mujoco
     from PIL import Image, ImageDraw
     from envs.robomimic_utils import make_env
     try:
@@ -1741,7 +1742,7 @@ def run_episode_stages(tr, src, state, man, *_):
             video = j < FLAGS.video_n_seeds
             if env is None:
                 np_state = np.random.get_state()  # robomimic's make_env reseeds numpy
-                env = make_env(FLAGS.env_name, seed=FLAGS.final_seed_base, render_offscreen=FLAGS.video_n_seeds > 0)
+                env = make_env(FLAGS.env_name, seed=FLAGS.final_seed_base)
                 np.random.set_state(np_state)
             sim = env.env.env  # RobomimicLowdimWrapper -> robomimic EnvRobosuite -> robosuite env
             t0 = time.time()
@@ -1751,9 +1752,15 @@ def run_episode_stages(tr, src, state, man, *_):
             rng = jax.random.PRNGKey(seed)  # the same actor noise stream for both rules
             codes, frames, success, t, decisions = [], [], 0, 0, 0
 
+            if video:  # robosuite's own offscreen renderer returns corrupted frames once build_agent_trainer has
+                # made and closed its envs; mujoco.Renderer (own EGL context, made current per render) does not
+                renderer = mujoco.Renderer(sim.sim.model._model, hw, hw)
+                scene_opt = mujoco.MjvOption()
+                scene_opt.geomgroup[0] = 0  # collision geoms hidden, as robosuite's renderer
+
             def frame():
-                im = Image.fromarray(np.ascontiguousarray(env.env.render(mode='rgb_array', height=hw, width=hw,
-                                                                         camera_name='agentview')))
+                renderer.update_scene(sim.sim.data._data, camera='agentview', scene_option=scene_opt)
+                im = Image.fromarray(renderer.render())
                 ImageDraw.Draw(im).text((3, 2), f'{labels[rule]} t={t} stage={codes[-1] if codes else 0}',
                                         fill=(255, 255, 0))
                 frames.append(np.asarray(im))
@@ -1782,6 +1789,7 @@ def run_episode_stages(tr, src, state, man, *_):
             first = {s: (int(np.argmax(c >= s)) + 1 if np.any(c >= s) else None) for s in (1, 2)}
             vpath = None
             if video:
+                renderer.close()
                 vpath = os.path.join(vid_dir, f'{rule}_seed{seed}.{ext}')
                 write_video(vpath, frames)
             part = dict(ident, rule=rule, seed=seed, success=success, length=t, decisions=decisions,
@@ -1818,7 +1826,8 @@ def run_episode_stages(tr, src, state, man, *_):
         eps = [parts[rule, j] for j in range(n_seeds)]
         s1 = [e['first_stage1_step'] for e in eps if e['first_stage1_step'] is not None]
         out['summary'][rule] = dict(episodes=len(eps), successes=sum(e['success'] for e in eps),
-                                    reached_stage1=len(s1), median_first_stage1_step=float(np.median(s1)) if s1 else None,
+                                    reached_stage1=len(s1),
+                                    median_first_stage1_step=float(np.median(s1)) if s1 else None,
                                     mean_length=float(np.mean([e['length'] for e in eps])))
     write_atomic(os.path.join(FLAGS.run_dir, 'episode_stages.json'),
                  (json.dumps(out, indent=1, default=str) + '\n').encode())
