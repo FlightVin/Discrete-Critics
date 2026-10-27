@@ -196,7 +196,7 @@ LATER_FLAG_DEFAULTS = {'bc_select_threshold': -1.0, 'probe_candidates': None, 'r
                        'diag_seed': 0, 'diag_rule': 'n1', 'diag_n_seeds': 32, 'diag_episodes': 4, 'anchors': 32,
                        'policy_ckpt': None, 'mc_k': 32, 'mc_seed': 0, 'mc_t_extra': 757,
                        'mc_part_size': 8, 'continuation': 'n1', 'diag_contract': 'auto', 'sel_seed': 0,
-                       'mc_candidates': 0, 'score_keys': 5}
+                       'mc_candidates': 0, 'score_keys': 5, 'switch_order': 'bon_first', 'switch_ks': ['0']}
 # Agent config keys added after runs were started: dropped from args.json / the config row at their default.
 LATER_AGENT_DEFAULTS = {'arb_readout_temp': 1.0, 'arb_label': 'hard', 'arb_vocab': 'ordinary',
                         'arb_rollin': 'canonical'}
