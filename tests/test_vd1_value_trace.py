@@ -324,9 +324,12 @@ def test_summary_size_1024_episodes(name, scalar, traces):
         rules[rule] = p
     v, sc, rv, rsc, oor = synth(1024)
     def ident(n):
-        return dict(n_unique_actions=rs.randint(1, 33, n).astype(np.int8),
-                    n_ties_at_max_distinct=rs.randint(1, 3, n).astype(np.int8),
-                    cand_sat_frac=rs.uniform(0, 1, n).astype(np.float32))
+        """Action-identity counts as in the tiny runs (32 distinct chunks, 1 distinct chunk at max), 1% arbitrary;
+        saturation a multiple of 1 / (N H adim) around the tiny runs' 0.075."""
+        odd = rs.rand(n) < 0.01
+        return dict(n_unique_actions=np.where(odd, rs.randint(1, 33, n), 32).astype(np.int8),
+                    n_ties_at_max_distinct=np.where(odd, rs.randint(1, 3, n), 1).astype(np.int8),
+                    cand_sat_frac=(rs.binomial(N * 8 * 7, 0.075, n) / (N * 8 * 7)).astype(np.float32))
     for p in rules.values():
         p.update(ident(len(p['episode'])))
     probe = dict(indices=np.arange(1024), value=v, score=sc, oor=oor, rep_value=rv.transpose(1, 0, 2), **ident(1024),
