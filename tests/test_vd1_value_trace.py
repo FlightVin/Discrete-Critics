@@ -122,6 +122,9 @@ def test_reproduces_final_eval(traces, agent):
             if agent == 'arb':
                 assert 'sel_q_return' in z and 'sel_u' not in z
         print(agent, rule, fe[rule]['successes'], vt['rules'][rule])
+    vt_wall = sum(p['wall_s'] for r in ('n1', 'bon') for p, _ in _parts(d, f'vt_{agent}', r))
+    print(f'COST {agent} final_eval_wall_s={fe["wall_s"]:.1f} value_trace_wall_s={vt_wall:.1f} '
+          f'ratio={vt_wall / fe["wall_s"]:.2f}')
     line = [l for l in out[agent]['vt']['lines'] if l.startswith('VALUE_TRACE ')]
     assert len(line) == 1 and 'per_episode' not in line[0]
 
