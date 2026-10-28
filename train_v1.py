@@ -25,6 +25,14 @@
                  but each setting (--switch_order, k in --switch_ks) uses a hybrid rule: bon_first: decisions
                  d < k (policy calls since the episode's reset) use bon, d >= k n1; n1_first: the reverse. Parts
                  <run_dir>/switch_eval_parts/{order}_{k}_{c}.json, then <run_dir>/switch_eval.json. No W&B.
+  --mode=value_trace  as final_eval (same source checks, seeds, chunks, RNG, parts / resume, preemption exit) and
+                 the same executed actions, recording on the side the critic's reads of the decision's candidates
+                 (bon: the agent's own 32 candidates and selection scores, replicated; n1: 32 shadow candidates
+                 from fold_in(rng, 1) read with fold_in(rng, 2), the executed chunk read with fold_in(rng, 3)) and
+                 --trace_repeats repeated reads (fold_in(rng, 100 + r)). Parts <run_dir>/value_trace_parts/
+                 {rule}_{c}.npz + .json; then the episodes are checked against --ref_final_eval, the
+                 --probe_candidates panel is read (probe_trace.npz) and value_trace_summary.npz +
+                 value_trace.json are written (vd1). No W&B.
   --mode=episode_stages  as final_eval (same source checks and loading): per rule (n1, bon) and env seed
                  final_seed_base + j, j < --stage_n_seeds, ONE episode in a single env (initial state as
                  final_eval's first episode of that seed) with per-step task-stage codes (tool hang: 0 none,
@@ -88,8 +96,8 @@ from log_utils import setup_wandb, get_flag_dict
 from utils.ckpt_v1 import CheckpointStore
 from utils.datasets import Dataset
 from utils.replay_v1 import FIELDS, SeqReplay
-from visualization.critic_probe import (make_candidates, probe_batch, probe_batch_scores, probe_fixed, probe_states,
-                                       tie_stats, uses_integer_score)
+from visualization.critic_probe import (ensemble_score, make_candidates, probe_batch, probe_batch_scores, probe_fixed,
+                                       probe_states, tie_stats, uses_integer_score)
 from visualization.eval_checkpoint import Policy
 
 if 'CUDA_VISIBLE_DEVICES' in os.environ:
@@ -100,7 +108,7 @@ FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_candidates', 'probe_ckpt',
                                       'final_eval', 'arb_introspect', 'diag_anchors', 'diag_mc', 'diag_score',
-                                      'diag_select', 'switch_eval', 'episode_stages'],
+                                      'diag_select', 'switch_eval', 'episode_stages', 'value_trace'],
                   'bc: shared BC preparation run; online: one method run; eval_actor: one n1 eval of --init_actor; '
                   'make_probe_candidates: fixed probe candidates of --init_actor to --out; probe_ckpt: probe the '
                   'committed checkpoint of --src_run_dir (read-only); final_eval: n1 + bon evaluation of the '
@@ -108,7 +116,8 @@ flags.DEFINE_enum('mode', 'online', ['bc', 'online', 'eval_actor', 'make_probe_c
                   'introspection of the committed checkpoint of --src_run_dir on --queries (read-only, geo5b); '
                   'diag_*: geo5a diagnostics of a finished --src_run_dir (read-only), see diag_main; '
                   'switch_eval: final_eval with bon for the first k decisions then n1 (or the reverse, geo8a); '
-                  'episode_stages: per-step task stages + videos of single n1 / bon episodes (geo8b).')
+                  'episode_stages: per-step task stages + videos of single n1 / bon episodes (geo8b); '
+                  'value_trace: final_eval recording the critic\'s candidate reads per decision (vd1).')
 flags.DEFINE_enum('method', None, list(V1_METHODS), 'v1 method preset (agents.v1_config); required online.')
 flags.DEFINE_string('run_dir', None, 'Run directory (checkpoints, metrics log, final_actor.pkl).')
 flags.DEFINE_string('init_actor', None, 'online / eval_actor: path to final_actor.pkl or selected_actor.pkl '
@@ -147,6 +156,8 @@ flags.DEFINE_integer('stage_n_seeds', 16, 'episode_stages: env seeds final_seed_
 flags.DEFINE_integer('video_n_seeds', 2, 'episode_stages: write videos for the first this many seeds.')
 flags.DEFINE_integer('video_hw', 160, 'episode_stages: video frame height and width.')
 flags.DEFINE_integer('video_stride', 4, 'episode_stages: env steps per video frame.')
+flags.DEFINE_integer('trace_repeats', 4, 'value_trace: repeated critic reads per decision (keys fold_in(rng, 100 + r)).')
+flags.DEFINE_string('ref_final_eval', None, 'value_trace: the source\'s final_eval.json (episodes must reproduce it).')
 flags.DEFINE_string('out', None, 'make_probe_candidates: output .npz path.')
 flags.DEFINE_string('queries', None, 'arb_introspect: query npz (utils/arb_introspect.py); diag_mc / diag_score: '
                     'query file (anchors.pkl or select_queries.pkl); diag_select: the common-panel anchors.pkl.')
@@ -1672,6 +1683,370 @@ def run_switch_eval(tr, src, state, man, n_seeds, C, E):
     return out
 
 
+TRACE_AGENTS = ('acarb', 'acbsc', 'acfql')
+TRACE_GRIDS = (('q1e3', 1e-3), ('q5e5', 5e-5))
+TRACE_SUBSAMPLE = 400
+
+
+def _trace_candidates(agent, observations, rng):
+    """The best-of-n candidates the agent's sample_actions draws from rng (acarb._candidates; acbsc / acfql inline):
+    (observations repeated (..., N, obs_dim), candidates (..., N, adim))."""
+    c = agent.config
+    adim = c['action_dim'] * (c['horizon_length'] if c['action_chunking'] else 1)
+    noises = jax.random.normal(rng, (*observations.shape[:-len(c['ob_dims'])], c['actor_num_samples'], adim))
+    obs = jnp.repeat(observations[..., None, :], c['actor_num_samples'], axis=-2)
+    return obs, jnp.clip(agent.compute_flow_actions(obs, noises), -1, 1)
+
+
+_TRACE_CANDIDATES = jax.jit(_trace_candidates)
+_BATCH_SCORES = jax.jit(ensemble_score)  # (score, value, oor) of a batch read out together, as in sample_actions
+
+
+def bon_trace_keys(agent, rng):
+    """(candidate key, selection-read key) of the agent's sample_actions: acarb splits rng into (rng, readout_rng);
+    acbsc / acfql draw the candidates from rng and read them out without a key."""
+    if agent.config['agent_name'] == 'acarb':
+        k = jax.random.split(rng)
+        return k[0], k[1]
+    return rng, rng
+
+
+def trace_u(name, value):
+    """Value in u units, float64, unclipped: acfql (Q + 100) / 100; acarb (S / K_den) and acbsc (probability) as is."""
+    v = np.asarray(value, dtype=np.float64)
+    return (v + 100.0) / 100.0 if name == 'acfql' else v
+
+
+def trace_q_return(name, value):
+    """QC contract return units, float64 (critic_outputs' q_return): acarb 100 u - 100, acfql the raw Q."""
+    v = np.asarray(value, dtype=np.float64)
+    return 100.0 * v - 100.0 if name == 'acarb' else v
+
+
+def argmax_changes_after_rounding(u, grid):
+    """Per row of u (..., N): does the first-index argmax change when u is rounded to multiples of grid (half up;
+    no clipping)?"""
+    u = np.asarray(u, dtype=np.float64)
+    return np.argmax(np.floor(u / grid + 0.5), axis=-1) != np.argmax(u, axis=-1)
+
+
+def npz_bytes(arrays):
+    """Deterministic .npz (fixed member order and timestamps, deflate): identical arrays give identical bytes."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for k in sorted(arrays):
+            b = io.BytesIO()
+            np.lib.format.write_array(b, np.asanyarray(arrays[k]), allow_pickle=False)
+            zi = zipfile.ZipInfo(f'{k}.npy', date_time=(1980, 1, 1, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(zi, b.getvalue(), compresslevel=9)
+    return buf.getvalue()
+
+
+def read_npz(path):
+    with np.load(path, allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def candidate_stats(name, score, u, rep_score, rep_u, exec_u, exec_u_reread, scalar):
+    """Compact per-row statistics of N candidates: score / u (rows, N) of the selection read, rep_score / rep_u
+    (rows, R, N) of the repeats; exec_u / exec_u_reread (rows,) the executed (or reference) chunk's reads."""
+    s = np.sort(u, axis=-1)
+    sel = np.argmax(score, axis=-1)
+    reads = np.concatenate([u[:, None], rep_u], axis=1)
+    out = dict(exec_value=np.asarray(exec_u, np.float32), exec_value_reread=np.asarray(exec_u_reread, np.float32),
+               cand_max=s[:, -1].astype(np.float32), cand_second=s[:, -2].astype(np.float32),
+               cand_min=s[:, 0].astype(np.float32), cand_mean=u.mean(-1).astype(np.float32),
+               n_unique=np.array([len(np.unique(r)) for r in u], dtype=np.int8),
+               n_ties_at_max=(score == score.max(-1, keepdims=True)).sum(-1).astype(np.int8),
+               readout_sd_mean=reads.std(axis=1).mean(-1).astype(np.float32),
+               argmax_agree=(np.argmax(rep_score, axis=-1) == sel[:, None]).sum(-1).astype(np.int8))
+    if scalar:
+        for tag, grid in TRACE_GRIDS:
+            out[f'argmax_change_{tag}'] = argmax_changes_after_rounding(u, grid).astype(np.int8)
+    return out
+
+
+def value_trace_summary(name, scalar, rules, probe, R):
+    """value_trace_summary.npz arrays. rules: {rule: dict of concatenated part arrays + 'episode' (global id)};
+    probe: the probe_trace arrays."""
+    out = {}
+    for rule, p in rules.items():
+        u, rep_u = trace_u(name, p['sel_value']), trace_u(name, p['rep_value'])
+        if rule == 'bon':
+            ix = np.arange(len(u))
+            exec_u = u[ix, p['sel_index']]
+            reread = rep_u[ix, 0, p['sel_index']] if R else np.full(len(u), np.nan)
+        else:
+            exec_u = trace_u(name, p['exec_value'])
+            reread = trace_u(name, p['exec_rep_value'][:, 0]) if R else np.full(len(u), np.nan)
+        st = candidate_stats(name, p['sel_score'], u, p['rep_score'], rep_u, exec_u, reread, scalar)
+        st['cand_oor_frac'] = p['sel_oor'].mean(-1).astype(np.float32)
+        st['episode'] = p['episode'].astype(np.int16)
+        st['decision'] = p['decision'].astype(np.int16)
+        for k, v in st.items():
+            out[f'{rule}/{k}'] = v
+        sub = np.sort(np.random.RandomState(0).choice(len(u), size=min(TRACE_SUBSAMPLE, len(u)), replace=False))
+        out[f'{rule}/sub_index'] = sub.astype(np.int32)
+        out[f'{rule}/sub_cand_value'] = u[sub].astype(np.float32)
+        out[f'{rule}/sub_cand_value_repeats'] = rep_u[sub].astype(np.float32)
+        if rule == 'n1':
+            out[f'{rule}/sub_exec_value_repeats'] = trace_u(name, p['exec_rep_value'][sub]).astype(np.float32)
+        else:
+            out[f'{rule}/sub_sel_index'] = p['sel_index'][sub].astype(np.int8)
+    u, rep_u = trace_u(name, probe['value']), trace_u(name, probe['rep_value'])
+    demo_u = trace_u(name, probe['demo_value'])
+    reread = trace_u(name, probe['demo_rep_value'][0]) if R else np.full(len(u), np.nan)
+    st = candidate_stats(name, probe['score'], u, probe['rep_score'].transpose(1, 0, 2), rep_u.transpose(1, 0, 2),
+                         demo_u, reread, scalar)
+    st['demo_value'], st['demo_value_reread'] = st.pop('exec_value'), st.pop('exec_value_reread')
+    st['cand_oor_frac'] = probe['oor'].mean(-1).astype(np.float32)
+    for k, v in st.items():
+        out[f'probe/{k}'] = v
+    out['probe/indices'] = probe['indices']
+    out['u_units'] = np.asarray('(Q + 100) / 100' if name == 'acfql' else 'value')
+    return out
+
+
+def run_value_trace(tr, src, state, man, n_seeds, C, E):
+    """value_trace (vd1): run_final_eval's episodes with the critic's candidate reads recorded per decision."""
+    import functools
+    name, R = tr.config['agent_name'], FLAGS.trace_repeats
+    if name not in TRACE_AGENTS:
+        refuse(f'value_trace supports agents {TRACE_AGENTS} (got {name})')
+    if not FLAGS.ref_final_eval or not FLAGS.probe_candidates:
+        refuse('--ref_final_eval and --probe_candidates are required for --mode=value_trace')
+    if R < 0:
+        refuse(f'--trace_repeats={R} < 0')
+    with open(FLAGS.ref_final_eval) as f:
+        ref = json.load(f)
+    want = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, n_eval_envs=C,
+                eval_episodes=E, seeds=[FLAGS.final_seed_base + j for j in range(n_seeds)])
+    got = {k: ref.get(k) for k in want}
+    if got != want:
+        refuse(f'--ref_final_eval {FLAGS.ref_final_eval} is for other settings: '
+               + json.dumps({k: (got[k], want[k]) for k in want if got[k] != want[k]}, default=str))
+    contract = value_contract(tr.config)
+    scalar = not sampled_readout(tr.config)
+    agent = tr.agent
+    parts_dir = os.path.join(FLAGS.run_dir, 'value_trace_parts')
+    os.makedirs(parts_dir, exist_ok=True)
+    tr.eval_envs = None
+    action_dim, H = tr.config['action_dim'], FLAGS.horizon_length
+    n_chunks = n_seeds // C
+    ident = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, n_eval_envs=C,
+                 eval_episodes=E, trace_repeats=R)
+    parts, done = {}, 0
+
+    def exit_preempted():
+        tr.close_envs()
+        dt = time.time() - tr.t_stop_ref
+        print(f'EXIT_PREEMPTED source={tr.stop_source} notice_to_exit_s={dt:.2f} phase=value_trace '
+              f'parts_done={done}', flush=True)
+        sys.exit(EXIT_PREEMPTED)
+
+    def record(rule, observations, rng, a, m, rec):
+        """The critic's reads at this decision for the m active envs (rows 0..m-1); a is the executed action."""
+        o, a = jnp.asarray(observations), np.asarray(a)
+        if rule == 'bon':
+            ck, rk = bon_trace_keys(agent, rng)
+            obs_rep, cands = _TRACE_CANDIDATES(agent, o, ck)
+            sel = _BATCH_SCORES(agent, obs_rep, cands, rk)
+            reps = [_BATCH_SCORES(agent, obs_rep, cands, jax.random.fold_in(rng, 100 + r)) for r in range(R)]
+        else:
+            _, cands = _TRACE_CANDIDATES(agent, o, jax.random.fold_in(rng, 1))
+            sel = _STATE_SCORES(agent, o, cands, jax.random.fold_in(rng, 2))
+            reps = [_STATE_SCORES(agent, o, cands, jax.random.fold_in(rng, 100 + r)) for r in range(R)]
+            ex = _ROW_SCORES(agent, o, jnp.asarray(a), jax.random.fold_in(rng, 3))
+            ex_reps = [_ROW_SCORES(agent, o, jnp.asarray(a), jax.random.fold_in(rng, 100 + r)) for r in range(R)]
+            for k, x in zip(('score', 'value', 'oor'), ex):
+                rec[f'exec_{k}'].append(np.asarray(x)[:m])
+            for i, k in enumerate(('score', 'value', 'oor')):
+                rec[f'exec_rep_{k}'].append(np.stack([np.asarray(x[i])[:m] for x in ex_reps], 1) if R else
+                                            np.zeros((m, 0), np.asarray(ex[i]).dtype))
+        for i, k in enumerate(('score', 'value', 'oor')):
+            rec[f'sel_{k}'].append(np.asarray(sel[i])[:m])
+            rec[f'rep_{k}'].append(np.stack([np.asarray(x[i])[:m] for x in reps], 1) if R else
+                                   np.zeros((m, 0, np.shape(sel[i])[-1]), np.asarray(sel[i]).dtype))
+        if rule == 'bon':
+            cands = np.asarray(cands)[:m]
+            idx = np.argmax(np.asarray(sel[0])[:m], axis=-1)  # first index on ties, as jnp.argmax
+            rec['sel_index'].append(idx.astype(np.int8))
+            rec['argmax_mismatch'].append(np.any(cands[np.arange(m), idx] != a[:m], axis=-1))
+
+    for rule in ('n1', 'bon'):
+        fn = n1_actions if rule == 'n1' else bon_actions
+        for c in range(n_chunks):
+            path = os.path.join(parts_dir, f'{rule}_{c}.json')
+            npz_path = os.path.join(parts_dir, f'{rule}_{c}.npz')
+            seeds = [FLAGS.final_seed_base + c * C + i for i in range(C)]
+            if os.path.exists(path) and os.path.exists(npz_path):
+                with open(path) as f:
+                    part = json.load(f)
+                if {k: part.get(k) for k in ident} != ident or part['seeds'] != seeds:
+                    tr.close_envs()
+                    refuse(f'{path} was written with other settings: '
+                           + json.dumps({k: part.get(k) for k in ident}))
+                print(f'VALUE_TRACE_PART_SKIP rule={rule} chunk={c}', flush=True)
+                parts[rule, c] = part
+                done += 1
+                continue
+            if tr.watcher is not None:
+                tr.watcher.check()
+            if tr.stop_requested:
+                exit_preempted()
+            if tr.eval_envs is None:
+                np_state = np.random.get_state()  # robomimic's make_env reseeds numpy (as in setup)
+                tr.eval_envs = make_vectorized_eval_envs(FLAGS.env_name, C, seed=FLAGS.final_seed_base)
+                np.random.set_state(np_state)
+            t0 = time.time()
+            envs = _AlignedEnvs(tr.eval_envs, C)
+            calls = dict(d=0, ep=-1)
+            rec = defaultdict(list)
+
+            def on_reset(calls=calls):
+                calls['d'] = 0
+                calls['ep'] += 1
+
+            def act(observations, rng, fn=fn, rule=rule, envs=envs, calls=calls, rec=rec):
+                if tr.stop_requested:
+                    raise EvalAborted()
+                envs.check_call(observations, calls['d'], H)
+                a = fn(tr.agent, observations, rng)
+                env_ix = np.flatnonzero(envs.active)
+                m = len(env_ix)
+                record(rule, observations, rng, a, m, rec)
+                rec['env'].append(env_ix.astype(np.int16))
+                rec['episode'].append(np.full(m, calls['ep'], np.int16))
+                rec['decision'].append(np.full(m, calls['d'], np.int16))
+                calls['d'] += 1
+                return a
+
+            tr.eval_envs.set_attr('v1_reseed', [functools.partial(_seed_numpy, s) for s in seeds])
+            tr.eval_envs.call('v1_reseed')
+            np.random.seed(final_eval_chunk_seed(c))
+            try:
+                _, _, _, eps = evaluate_parallel(agent=Policy(act), envs=envs, num_eval_envs=C, eval_episodes=E,
+                                                 action_dim=action_dim, return_episodes=True, on_reset=on_reset)
+            except EvalAborted:
+                print(f'EVAL_ABORTED ({tr.stop_source}) rule={rule} chunk={c}', flush=True)
+                exit_preempted()
+            assert calls['ep'] == E - 1, calls
+            arrays = {k: np.concatenate(v) for k, v in rec.items()}
+            if contract == 'qc':
+                for k in ('sel', 'exec') if rule == 'n1' else ('sel',):
+                    arrays[f'{k}_q_return'] = trace_q_return(name, arrays[f'{k}_value'])
+            if name == 'acfql':
+                for k in [k for k in arrays if k.endswith('value')]:
+                    arrays[k[:-len('value')] + 'u'] = trace_u(name, arrays[k])
+            digest = [[hashlib.sha256(np.ascontiguousarray(o, dtype=np.float64).tobytes()).hexdigest()[:16]
+                       for o in env_obs] for env_obs in eps['first_obs']]
+            reps = [np.abs(arrays['rep_value'] - arrays['sel_value'][:, None]).max(initial=0.0)]
+            if rule == 'n1':
+                reps.append(np.abs(arrays['exec_rep_value'] - arrays['exec_value'][:, None]).max(initial=0.0))
+            part = dict(ident, rule=rule, chunk=c, seeds=seeds, success=eps['success'].astype(int).tolist(),
+                        length=eps['length'].tolist(), first_obs_digest=digest, n_decisions=len(arrays['env']),
+                        bon_argmax_mismatches=int(arrays['argmax_mismatch'].sum()) if rule == 'bon' else 0,
+                        repeat_max_abs_diff=float(max(reps)), wall_s=time.time() - t0)
+            write_atomic(npz_path, npz_bytes(arrays))
+            write_atomic(path, (json.dumps(part) + '\n').encode())  # written last: marks the part complete
+            parts[rule, c] = part
+            done += 1
+            print(f'VALUE_TRACE_PART rule={rule} chunk={c} successes={int(np.sum(part["success"]))}/{C * E} '
+                  f'decisions={part["n_decisions"]} bon_argmax_mismatches={part["bon_argmax_mismatches"]} '
+                  f'repeat_max_abs_diff={part["repeat_max_abs_diff"]:.3g} wall_s={part["wall_s"]:.1f}', flush=True)
+    tr.close_envs()
+
+    # reproduction of --ref_final_eval (episodes; first-observation digests from its parts if present)
+    ref_parts = os.path.join(os.path.dirname(os.path.abspath(FLAGS.ref_final_eval)), 'final_eval_parts')
+    n_match, n_eps, n_dig, dig_bad, per_rule = 0, 0, 0, 0, {}
+    for rule in ('n1', 'bon'):
+        S = np.concatenate([np.asarray(parts[rule, c]['success'], dtype=np.int64) for c in range(n_chunks)])
+        L = np.concatenate([np.asarray(parts[rule, c]['length'], dtype=np.int64) for c in range(n_chunks)])
+        ok = (S == np.asarray(ref[rule]['per_episode_success'])) & (L == np.asarray(ref[rule]['per_episode_length']))
+        n_match, n_eps = n_match + int(ok.sum()), n_eps + int(ok.size)
+        for c in range(n_chunks):
+            rp = os.path.join(ref_parts, f'{rule}_{c}.json')
+            if os.path.exists(rp):
+                with open(rp) as f:
+                    theirs = np.asarray(json.load(f)['first_obs_digest'])
+                mine = np.asarray(parts[rule, c]['first_obs_digest'])
+                n_dig, dig_bad = n_dig + mine.size, dig_bad + int((mine != theirs).sum())
+        per_rule[rule] = dict(successes=int(S.sum()), episodes=int(S.size), ref_successes=ref[rule]['successes'],
+                              n_decisions=sum(parts[rule, c]['n_decisions'] for c in range(n_chunks)))
+    mismatches = sum(parts['bon', c]['bon_argmax_mismatches'] for c in range(n_chunks))
+    rep_diff = max(p['repeat_max_abs_diff'] for p in parts.values())
+
+    # common panel: fixed demonstration states, fixed BC-actor candidates, the demonstration chunk
+    tr.setup_probe(tr.config)
+    obs, cands, demo = tr.probe_obs, tr.probe_cands, tr.probe_actions
+    keys = [jax.random.PRNGKey(0)] + [jax.random.PRNGKey(100 + r) for r in range(R)]
+    reads = [critic_outputs(agent, obs, cands, k, contract, per_state=True) for k in keys]
+    dreads = [critic_outputs(agent, obs, demo, k, contract) for k in keys]
+    stack = lambda xs, k, like: np.stack([x[k] for x in xs]) if xs else np.zeros((0, *like.shape), like.dtype)  # noqa
+    probe = dict(indices=np.asarray(tr.probe_idx), steps_left=np.asarray(tr.probe_steps_left),
+                 score=reads[0]['score'], value=reads[0]['value'].astype(np.float32), oor=reads[0]['oor'],
+                 rep_score=stack(reads[1:], 'score', reads[0]['score']),
+                 rep_value=stack(reads[1:], 'value', reads[0]['value']).astype(np.float32),
+                 demo_score=dreads[0]['score'], demo_value=dreads[0]['value'].astype(np.float32),
+                 demo_oor=dreads[0]['oor'],
+                 demo_rep_value=stack(dreads[1:], 'value', dreads[0]['value']).astype(np.float32))
+    for k in ('q_return', 'sigmoid_mean_logit'):
+        if k in reads[0]:
+            probe[k], probe[f'demo_{k}'] = reads[0][k], dreads[0][k]
+    if name == 'acfql':
+        probe['u'], probe['demo_u'] = trace_u(name, probe['value']), trace_u(name, probe['demo_value'])
+    write_atomic(os.path.join(FLAGS.run_dir, 'probe_trace.npz'), npz_bytes(probe))
+
+    rules = {}
+    for rule in ('n1', 'bon'):
+        cat = defaultdict(list)
+        for c in range(n_chunks):
+            z = read_npz(os.path.join(parts_dir, f'{rule}_{c}.npz'))
+            z['episode'] = (c * C + z['env'].astype(np.int64)) * E + z['episode']  # final_eval's episode order
+            for k, v in z.items():
+                cat[k].append(v)
+        rules[rule] = {k: np.concatenate(v) for k, v in cat.items()}
+    summary_path = os.path.join(FLAGS.run_dir, 'value_trace_summary.npz')
+    write_atomic(summary_path, npz_bytes(value_trace_summary(name, scalar, rules, probe, R)))
+    summary_bytes = os.path.getsize(summary_path)
+
+    ctr = dict(state['ctr'])
+    out = dict(src_run_dir=src, gen=man['gen'], phase=state['phase'], ctr=ctr,
+               step=int(ctr.get('env_steps', 0) or ctr.get('bc_updates', 0)), env_name=FLAGS.env_name,
+               horizon_length=FLAGS.horizon_length, method=FLAGS.method, agent_name=name,
+               agent=strip_later_agent_defaults(tr.config.to_dict()), contract=contract, scalar_readout=scalar,
+               final_seed_base=FLAGS.final_seed_base, n_eval_envs=C, eval_episodes=E, trace_repeats=R,
+               ref_final_eval=os.path.abspath(FLAGS.ref_final_eval), probe_candidates=tr.probe_cands_info,
+               n_episodes_match=n_match, n_episodes=n_eps, first_obs_digests_checked=n_dig,
+               first_obs_digest_mismatches=dig_bad, bon_argmax_mismatches=mismatches,
+               scalar_repeat_max_abs_diff=rep_diff if scalar else None, repeat_max_abs_diff=rep_diff,
+               rules=per_rule, probe_states=int(len(obs)), summary_bytes=summary_bytes)
+    failures = []
+    if n_match != n_eps:
+        failures.append(f'{n_eps - n_match}/{n_eps} episodes differ from --ref_final_eval')
+    if dig_bad:
+        failures.append(f'{dig_bad}/{n_dig} first-observation digests differ from --ref_final_eval\'s parts')
+    if mismatches:
+        failures.append(f'{mismatches} bon decisions whose replicated argmax candidate is not the executed action')
+    if scalar and rep_diff != 0:
+        failures.append(f'scalar readout: repeated reads differ from the first (max abs diff {rep_diff})')
+    out['ok'], out['failures'] = not failures, failures
+    write_atomic(os.path.join(FLAGS.run_dir, 'value_trace.json'),
+                 (json.dumps(out, indent=1, default=str) + '\n').encode())
+    print('VALUE_TRACE ' + json.dumps({k: v for k, v in out.items() if k not in ('agent', 'ctr', 'probe_candidates')},
+                                      default=str), flush=True)
+    if failures:
+        print('VALUE_TRACE_FAILED ' + '; '.join(failures), flush=True)
+        sys.exit(EXIT_TRACE_FAILED)
+    return out
+
+
+EXIT_TRACE_FAILED = 3
+
+
 def run_episode_stages(tr, src, state, man, *_):
     """--mode=episode_stages (geo8b): one episode per (rule, env seed final_seed_base + j) in a single env, as
     final_eval's actions (one H-step chunk per decision, the env's step limit), recording the task-stage code
@@ -2392,6 +2767,9 @@ def main(_):
         return
     if FLAGS.mode == 'episode_stages':
         final_eval(runner=run_episode_stages)
+        return
+    if FLAGS.mode == 'value_trace':
+        final_eval(runner=run_value_trace)
         return
     if FLAGS.mode.startswith('diag_'):
         diag_main()
