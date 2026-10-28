@@ -1,0 +1,37 @@
+arb n1 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+arb bon 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+COST arb final_eval_wall_s=162.5 value_trace_wall_s=182.7 ratio=1.12
+.bsc n1 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+bsc bon 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+COST bsc final_eval_wall_s=159.4 value_trace_wall_s=168.9 ratio=1.06
+.qc n1 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+qc bon 0 {'successes': 0, 'episodes': 16, 'ref_successes': 0, 'n_decisions': 1280}
+COST qc final_eval_wall_s=158.1 value_trace_wall_s=167.7 ratio=1.06
+.ROBOMIMIC WARNING(
+    No private macro file found!
+    It is recommended to use a private macro file
+    To setup, run: python /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/robomimic/scripts/setup_macros.py
+)
+....ACTION_IDENTITY arb n1 rows=1280 n_unique_actions<32=0 ties=20 identical_chunk_ties=0 cand_sat_frac_mean=0.074
+ACTION_IDENTITY arb bon rows=1280 n_unique_actions<32=0 ties=16 identical_chunk_ties=0 cand_sat_frac_mean=0.070
+ACTION_IDENTITY arb probe rows=256 n_unique_actions<32=0 ties=3 identical_chunk_ties=0 cand_sat_frac_mean=0.038
+.ACTION_IDENTITY bsc n1 rows=1280 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.074
+ACTION_IDENTITY bsc bon rows=1280 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.075
+ACTION_IDENTITY bsc probe rows=256 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.038
+.ACTION_IDENTITY qc n1 rows=1280 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.074
+ACTION_IDENTITY qc bon rows=1280 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.084
+ACTION_IDENTITY qc probe rows=256 n_unique_actions<32=0 ties=0 identical_chunk_ties=0 cand_sat_frac_mean=0.038
+....SUMMARY_SIZE acarb synthetic_decisions=163870 bytes=2044466 tiny_run bytes=177743 decisions=2560
+.SUMMARY_SIZE acbsc synthetic_decisions=163870 bytes=3463526 tiny_run bytes=210799 decisions=2560
+.SUMMARY_SIZE acfql synthetic_decisions=163870 bytes=3364393 tiny_run bytes=199587 decisions=2560
+.
+=============================== warnings summary ===============================
+tests/test_vd1_value_trace.py::test_bon_replica_equals_agent[arb_qc-overrides0]
+  /data/user_data/vineethb/envs/discrete-critics/lib64/python3.12/site-packages/tensorflow_probability/python/internal/backend/jax/ops.py:681: DeprecationWarning: jax.interpreters.xla.pytype_aval_mappings is deprecated.
+    jax.interpreters.xla.pytype_aval_mappings[onp.ndarray])
+
+tests/test_vd1_value_trace.py::test_bon_replica_equals_agent[arb_qc-overrides0]
+  <frozen importlib._bootstrap>:530: DeprecationWarning: the load_module() method is deprecated and slated for removal in Python 3.15; use exec_module() instead
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+16 passed, 2 warnings in 932.67s (0:15:32)
