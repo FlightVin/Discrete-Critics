@@ -1730,18 +1730,20 @@ def argmax_changes_after_rounding(u, grid):
     return np.argmax(np.floor(u / grid + 0.5), axis=-1) != np.argmax(u, axis=-1)
 
 
-def npz_bytes(arrays):
-    """Deterministic .npz (fixed member order and timestamps, deflate): identical arrays give identical bytes."""
+def npz_bytes(arrays, lzma=False):
+    """Deterministic .npz (fixed member order and timestamps; deflate, or LZMA: ~8% smaller on float32 values,
+    slower): identical arrays give identical bytes. np.load reads both."""
     import io
     import zipfile
+    method = zipfile.ZIP_LZMA if lzma else zipfile.ZIP_DEFLATED
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+    with zipfile.ZipFile(buf, 'w', method) as z:
         for k in sorted(arrays):
             b = io.BytesIO()
             np.lib.format.write_array(b, np.asanyarray(arrays[k]), allow_pickle=False)
             zi = zipfile.ZipInfo(f'{k}.npy', date_time=(1980, 1, 1, 0, 0, 0))
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            z.writestr(zi, b.getvalue(), compresslevel=9)
+            zi.compress_type = method
+            z.writestr(zi, b.getvalue(), compresslevel=None if lzma else 6)
     return buf.getvalue()
 
 
@@ -1759,9 +1761,10 @@ def candidate_stats(name, score, u, rep_score, rep_u, exec_u, exec_u_reread, sca
     out = dict(exec_value=np.asarray(exec_u, np.float32), exec_value_reread=np.asarray(exec_u_reread, np.float32),
                cand_max=s[:, -1].astype(np.float32), cand_second=s[:, -2].astype(np.float32),
                cand_min=s[:, 0].astype(np.float32), cand_mean=u.mean(-1).astype(np.float32),
-               n_unique=np.array([len(np.unique(r)) for r in u], dtype=np.int8),
+               n_unique=(1 + (np.diff(s, axis=-1) != 0).sum(-1)).astype(np.int8),
                n_ties_at_max=(score == score.max(-1, keepdims=True)).sum(-1).astype(np.int8),
-               readout_sd_mean=reads.std(axis=1).mean(-1).astype(np.float32),
+               # SD of the deviations from the first read: exactly 0 for bit-identical reads
+               readout_sd_mean=(reads - reads[:, :1]).std(axis=1).mean(-1).astype(np.float32),
                argmax_agree=(np.argmax(rep_score, axis=-1) == sel[:, None]).sum(-1).astype(np.int8))
     if scalar:
         for tag, grid in TRACE_GRIDS:
@@ -2010,7 +2013,7 @@ def run_value_trace(tr, src, state, man, n_seeds, C, E):
                 cat[k].append(v)
         rules[rule] = {k: np.concatenate(v) for k, v in cat.items()}
     summary_path = os.path.join(FLAGS.run_dir, 'value_trace_summary.npz')
-    write_atomic(summary_path, npz_bytes(value_trace_summary(name, scalar, rules, probe, R)))
+    write_atomic(summary_path, npz_bytes(value_trace_summary(name, scalar, rules, probe, R), lzma=True))
     summary_bytes = os.path.getsize(summary_path)
 
     ctr = dict(state['ctr'])
