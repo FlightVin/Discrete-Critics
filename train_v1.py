@@ -1753,6 +1753,26 @@ def read_npz(path):
         return {k: z[k] for k in z.files}
 
 
+def action_identity_stats(cands, score):
+    """Per row of N candidate chunks cands (rows, N, ...) and their selection scores (rows, N), by exact float equality
+    of the full flattened chunk: n_unique_actions (distinct chunks), n_ties_at_max_distinct (distinct chunks among
+    the candidates whose score equals the row max) and cand_sat_frac (fraction of entries with |a| == 1)."""
+    c = np.asarray(cands, np.float32)
+    c = c.reshape(*c.shape[:2], -1)
+    score = np.asarray(score)
+    eq = (c[:, :, None, :] == c[:, None, :, :]).all(-1)  # (rows, N, N)
+    earlier = np.tril(np.ones(eq.shape[1:], bool), -1)  # j < i
+    first = ~(eq & earlier).any(-1)  # i is the first occurrence of its chunk
+    tie = score == score.max(-1, keepdims=True)
+    first_tie = tie & ~(eq & earlier & tie[:, None, :]).any(-1)  # first occurrence among the tied candidates
+    return dict(n_unique_actions=first.sum(-1).astype(np.int8),
+                n_ties_at_max_distinct=first_tie.sum(-1).astype(np.int8),
+                cand_sat_frac=(np.abs(c) == 1).mean((1, 2)).astype(np.float32))
+
+
+TRACE_ACTION_KEYS = ('n_unique_actions', 'n_ties_at_max_distinct', 'cand_sat_frac')
+
+
 def candidate_stats(name, score, u, rep_score, rep_u, exec_u, exec_u_reread, scalar):
     """Compact per-row statistics of N candidates: score / u (rows, N) of the selection read, rep_score / rep_u
     (rows, R, N) of the repeats; exec_u / exec_u_reread (rows,) the executed (or reference) chunk's reads."""
@@ -1788,6 +1808,8 @@ def value_trace_summary(name, scalar, rules, probe, R):
             reread = trace_u(name, p['exec_rep_value'][:, 0]) if R else np.full(len(u), np.nan)
         st = candidate_stats(name, p['sel_score'], u, p['rep_score'], rep_u, exec_u, reread, scalar)
         st['cand_oor_frac'] = p['sel_oor'].mean(-1).astype(np.float32)
+        for k in TRACE_ACTION_KEYS:
+            st[k] = p[k]
         st['episode'] = p['episode'].astype(np.int16)
         st['decision'] = p['decision'].astype(np.int16)
         for k, v in st.items():
@@ -1807,6 +1829,8 @@ def value_trace_summary(name, scalar, rules, probe, R):
                          demo_u, reread, scalar)
     st['demo_value'], st['demo_value_reread'] = st.pop('exec_value'), st.pop('exec_value_reread')
     st['cand_oor_frac'] = probe['oor'].mean(-1).astype(np.float32)
+    for k in TRACE_ACTION_KEYS:
+        st[k] = probe[k]
     for k, v in st.items():
         out[f'probe/{k}'] = v
     out['probe/indices'] = probe['indices']
@@ -1841,7 +1865,7 @@ def run_value_trace(tr, src, state, man, n_seeds, C, E):
     action_dim, H = tr.config['action_dim'], FLAGS.horizon_length
     n_chunks = n_seeds // C
     ident = dict(src_run_dir=src, gen=man['gen'], final_seed_base=FLAGS.final_seed_base, n_eval_envs=C,
-                 eval_episodes=E, trace_repeats=R)
+                 eval_episodes=E, trace_repeats=R, trace_version=2)
     parts, done = {}, 0
 
     def exit_preempted():
@@ -1874,8 +1898,10 @@ def run_value_trace(tr, src, state, man, n_seeds, C, E):
             rec[f'sel_{k}'].append(np.asarray(sel[i])[:m])
             rec[f'rep_{k}'].append(np.stack([np.asarray(x[i])[:m] for x in reps], 1) if R else
                                    np.zeros((m, 0, np.shape(sel[i])[-1]), np.asarray(sel[i]).dtype))
+        cands = np.asarray(cands)[:m]
+        for k, v in action_identity_stats(cands, np.asarray(sel[0])[:m]).items():
+            rec[k].append(v)
         if rule == 'bon':
-            cands = np.asarray(cands)[:m]
             idx = np.argmax(np.asarray(sel[0])[:m], axis=-1)  # first index on ties, as jnp.argmax
             rec['sel_index'].append(idx.astype(np.int8))
             rec['argmax_mismatch'].append(np.any(cands[np.arange(m), idx] != a[:m], axis=-1))
@@ -1996,7 +2022,8 @@ def run_value_trace(tr, src, state, man, n_seeds, C, E):
                  rep_value=stack(reads[1:], 'value', reads[0]['value']).astype(np.float32),
                  demo_score=dreads[0]['score'], demo_value=dreads[0]['value'].astype(np.float32),
                  demo_oor=dreads[0]['oor'],
-                 demo_rep_value=stack(dreads[1:], 'value', dreads[0]['value']).astype(np.float32))
+                 demo_rep_value=stack(dreads[1:], 'value', dreads[0]['value']).astype(np.float32),
+                 **action_identity_stats(cands, reads[0]['score']))
     for k in ('q_return', 'sigmoid_mean_logit'):
         if k in reads[0]:
             probe[k], probe[f'demo_{k}'] = reads[0][k], dreads[0][k]

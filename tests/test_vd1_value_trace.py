@@ -5,7 +5,7 @@ acarb, scalar BSC acbsc, scalar QC acfql). final_eval and value_trace on 8 seeds
 value_trace reproduces final_eval episode by episode with no bon argmax mismatch; scalar repeat reads equal the first
 read, acarb's differ; --trace_repeats does not change the episodes; a second invocation skips every part and writes
 identical outputs. In process: the bon replica equals each agent's own best-of-N (candidates, scores, choice), the
-rounding helper on hand-made arrays, and the summary size at the 1,024-episode scale.
+rounding helper and the action-identity counts on hand-made arrays, and the summary size at the 1,024-episode scale.
 
 Run from the project root with MUJOCO_GL=egl and ROBOMIMIC_DATA_DIR set.
 """
@@ -211,6 +211,19 @@ def test_repeat_reads(traces, agent):
             assert (s[f'{rule}/readout_sd_mean'] > 0).any() and 'bon/argmax_change_q1e3' not in s
     np.testing.assert_array_equal(s['bon/exec_value'], s['bon/cand_max'])  # bon executes the selection argmax
     assert s['probe/cand_max'].shape == (256,) and s['probe/demo_value'].shape == (256,)
+    for g in ('n1', 'bon', 'probe'):
+        nu, nt, ntd, sat = (s[f'{g}/{k}'] for k in ('n_unique_actions', 'n_ties_at_max', 'n_ties_at_max_distinct',
+                                                    'cand_sat_frac'))
+        assert nu.dtype == ntd.dtype == np.int8 and sat.dtype == np.float32
+        assert nu.shape == ntd.shape == sat.shape == nt.shape
+        assert (1 <= nu).all() and (nu <= 32).all() and (1 <= ntd).all() and (ntd <= nt).all() and (ntd <= nu).all()
+        assert ((0 <= sat) & (sat <= 1)).all()
+        print(f'ACTION_IDENTITY {agent} {g} rows={len(nu)} n_unique_actions<32={int((nu < 32).sum())} '
+              f'ties={int((nt > 1).sum())} identical_chunk_ties={int((ntd < nt).sum())} '
+              f'cand_sat_frac_mean={sat.mean():.3f}')
+    for rule in ('n1', 'bon'):
+        for _, z in _parts(d, f'vt_{agent}', rule):
+            assert z['n_unique_actions'].shape == z['cand_sat_frac'].shape == (len(z['env']),)
 
 
 # ---- 4. rounding helper ------------------------------------------------------------------------------------
@@ -237,6 +250,33 @@ def test_argmax_changes_after_rounding():
     assert f(np.array([[0.300024, 0.300026]]), 5e-5).tolist() == [False]  # just below / above 0.300025
     assert f(np.array([[0.300026, 0.300074]]), 5e-5).tolist() == [True]   # both 0.30005 -> index 0
     assert f(np.array([[0.2, 0.7, 0.7], [0.7, 0.2, 0.7]]), g).tolist() == [False, False]  # ties: first index
+
+
+def test_action_identity_stats():
+    from train_v1 import action_identity_stats as f
+    rs = np.random.RandomState(0)
+    c = rs.uniform(-0.9, 0.9, (2, 6, 5, 7)).astype(np.float32)  # rows, N, H, adim
+    score = np.array([[0.1, 0.2, 0.2, 0.2, 0.2, 0.0], [0.3, 0.1, 0.3, 0.3, 0.0, 0.2]], np.float32)
+    # row 0: candidates 1 and 2 identical (both saturated) and tied at max; 3 and 4 distinct, also tied at max
+    c[0, 1] = np.clip(c[0, 1] * 10, -1, 1)
+    c[0, 2] = c[0, 1]
+    c[0, 5, 0, :3] = [1.0, -1.0, 1.0]
+    # row 1: candidate 4 (not tied) equals tied candidate 0; -0.0 == 0.0 exactly
+    c[1, 4] = c[1, 0]
+    c[1, 0, 0, 0], c[1, 4, 0, 0] = 0.0, -0.0
+    out = f(c, score)
+    assert out['n_unique_actions'].tolist() == [5, 5]
+    assert out['n_ties_at_max_distinct'].tolist() == [3, 3]
+    n_ties = (score == score.max(-1, keepdims=True)).sum(-1)
+    assert n_ties.tolist() == [4, 3]  # row 0: one tie from an identical chunk; row 1: none
+    sat0 = (2 * (np.abs(c[0, 1]) == 1).sum() + 3) / c[0].size
+    np.testing.assert_allclose(out['cand_sat_frac'], [sat0, 0.0], rtol=1e-6)
+    assert out['n_unique_actions'].dtype == out['n_ties_at_max_distinct'].dtype == np.int8
+    assert out['cand_sat_frac'].dtype == np.float32
+    # all 32 identical: 1 distinct chunk, 1 distinct tie, all tied
+    same = np.ones((1, 32, 35), np.float32)
+    o = f(same, np.zeros((1, 32)))
+    assert (o['n_unique_actions'][0], o['n_ties_at_max_distinct'][0], o['cand_sat_frac'][0]) == (1, 1, 1.0)
 
 
 # ---- 5. resume ---------------------------------------------------------------------------------------------
@@ -283,7 +323,13 @@ def test_summary_size_1024_episodes(name, scalar, traces):
             p['exec_value'], p['exec_rep_value'] = v[:, 0], rv[:, :, 0]
         rules[rule] = p
     v, sc, rv, rsc, oor = synth(1024)
-    probe = dict(indices=np.arange(1024), value=v, score=sc, oor=oor, rep_value=rv.transpose(1, 0, 2),
+    def ident(n):
+        return dict(n_unique_actions=rs.randint(1, 33, n).astype(np.int8),
+                    n_ties_at_max_distinct=rs.randint(1, 3, n).astype(np.int8),
+                    cand_sat_frac=rs.uniform(0, 1, n).astype(np.float32))
+    for p in rules.values():
+        p.update(ident(len(p['episode'])))
+    probe = dict(indices=np.arange(1024), value=v, score=sc, oor=oor, rep_value=rv.transpose(1, 0, 2), **ident(1024),
                  rep_score=rsc.transpose(1, 0, 2), demo_value=v[:, 0], demo_rep_value=rv[:, :, 0].T)
     size = len(T.npz_bytes(T.value_trace_summary(name, scalar, rules, probe, n_rep), lzma=True))
     d, _ = traces
